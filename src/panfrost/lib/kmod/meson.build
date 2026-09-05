@@ -3,6 +3,8 @@
 
 libpankmod_lib_files = files(
   'pan_kmod.c',
+  'kbase_handshake.c'
+  
 )
 
 if panfrost_kmds.contains('panfrost')
