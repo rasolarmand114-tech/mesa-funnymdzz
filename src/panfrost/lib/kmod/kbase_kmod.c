@@ -88,8 +88,23 @@ const struct pan_kmod_ops kbase_kmod_ops;
 struct kbase_kmod_dev {
    struct pan_kmod_dev base;
 
-   /* True for the CSF flavour of kbase (arch >= 10), false for JM. */
+   /* True for the CSF flavour of kbase (arch >= 10), false for JM. This is
+    * set exactly once, at kbase_kmod_dev_create() time, from the version
+    * handshake, and must never be re-derived or overwritten afterwards:
+    * every JM-only and CSF-only code path in this file and in kbase_jm.c
+    * trusts kbase_gfx_dev_kind() (which reads this same handshake result
+    * back off dev->driver.version) to keep the two command-submission
+    * models mutually exclusive for the lifetime of the device. */
    bool is_csf;
+
+   /* Whether the EXEC_VA zone is actually usable for GPU-executable
+    * allocations: either the kernel auto-initialised it (modern CSF, uAPI
+    * >= 1.9) or the explicit KBASE_IOCTL_MEM_EXEC_INIT call below
+    * succeeded. When false, kbase_kmod_bo_alloc() refuses
+    * PAN_KMOD_BO_FLAG_EXECUTABLE allocations up front with a clear error
+    * instead of letting the kernel fail the MEM_ALLOC ioctl deep inside a
+    * caller that has no way to explain *why* it got ENOMEM/EPERM. */
+   bool exec_va_ready;
 
    /* CSF interface information (CSF only), queried from
     * KBASE_IOCTL_CS_GET_GLB_IFACE and stored in the panthor uAPI layout
@@ -1274,15 +1289,45 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    bool csf_auto_exec_va =
       is_csf && (ver.major > 1 || (ver.major == 1 && ver.minor >= 9));
 
-   if (!csf_auto_exec_va) {
-      struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
-      if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
-         mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
-                   "(executable BO allocation will not work)", strerror(errno));
-      }
-   } else {
+   bool exec_va_ready = false;
+
+   if (csf_auto_exec_va) {
       mesa_logd("kbase: CSF uAPI %d.%d auto-initialises EXEC_VA, skipping "
                 "KBASE_IOCTL_MEM_EXEC_INIT", ver.major, ver.minor);
+      exec_va_ready = true;
+   } else {
+      struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
+      if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init) == 0) {
+         exec_va_ready = true;
+      } else if (errno == EPERM || errno == EBUSY) {
+         /* On a device/kernel that already carves out EXEC_VA itself (some
+          * vendor kbase forks do this on JM parts too, not just modern CSF)
+          * this ioctl is expected to be rejected as "zone already
+          * initialised" -- that is not a failure, the zone is usable. We
+          * cannot ask the kernel to disambiguate the two cases (both
+          * return EPERM), so treat it as the benign case here and let the
+          * first real executable allocation be the actual test: if the
+          * zone genuinely isn't there, KBASE_IOCTL_MEM_ALLOC on that
+          * allocation will fail instead, and kbase_kmod_bo_alloc() below
+          * reports that failure with the EXEC_VA context attached. */
+         mesa_logd("kbase: KBASE_IOCTL_MEM_EXEC_INIT rejected (%s); "
+                   "assuming EXEC_VA is already initialised",
+                   strerror(errno));
+         exec_va_ready = true;
+      } else {
+         /* Anything other than EPERM/EBUSY (ENOMEM, EINVAL, ENOTTY, ...) is
+          * a genuine failure: no executable allocation will work, so don't
+          * pretend otherwise. On stock/non-rooted Android this most often
+          * means the calling process' SELinux domain is not permitted to
+          * set up GPU-executable memory on this kbase node -- that is a
+          * kernel/policy restriction outside what this driver can patch
+          * around; running as root or on a permissive/custom kernel is the
+          * usual workaround. */
+         mesa_loge("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
+                   "(GPU-executable allocations will fail; this is usually "
+                   "a kernel/SELinux permission restriction, not a driver "
+                   "bug)", strerror(errno));
+      }
    }
 
    struct kbase_kmod_dev *kbase_dev =
@@ -1315,6 +1360,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
                      &kbase_kmod_ops, allocator);
 
    kbase_dev->is_csf = is_csf;
+   kbase_dev->exec_va_ready = exec_va_ready;
    kbase_dev->tracking_page = tracking_page;
    kbase_dev->next_handle = 1;
    kbase_dev->dma_heap_fd = -1;
@@ -1631,6 +1677,18 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
                        PAN_KMOD_BO_FLAG_CSF_EVENT)))
       return kbase_kmod_bo_alloc_dmabuf(dev, size, kmod_flags);
 
+   if ((kmod_flags & PAN_KMOD_BO_FLAG_EXECUTABLE) && !kbase_dev->exec_va_ready) {
+      /* Fail fast with a diagnosable error instead of letting
+       * KBASE_IOCTL_MEM_ALLOC(_EX) below fail for a reason the caller has
+       * no context to explain. See the KBASE_IOCTL_MEM_EXEC_INIT handling
+       * in kbase_kmod_dev_create() for why the zone may be unavailable. */
+      mesa_loge("kbase: refusing executable BO allocation: EXEC_VA zone "
+                "was not initialised for this device (see the "
+                "KBASE_IOCTL_MEM_EXEC_INIT error logged at device open)");
+      errno = EPERM;
+      return NULL;
+   }
+
    const uint64_t page_size = 4096;
    uint64_t va_pages = (size + page_size - 1) / page_size;
 
@@ -1670,8 +1728,12 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       };
 
       if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC_EX, &req)) {
-         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC_EX failed: %s",
-                   strerror(errno));
+         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC_EX failed: %s%s",
+                   strerror(errno),
+                   (kmod_flags & PAN_KMOD_BO_FLAG_EXECUTABLE)
+                      ? " (executable allocation; EXEC_VA zone may be "
+                        "unusable despite the earlier ready check)"
+                      : "");
          goto err_free_bo;
       }
 
@@ -1688,7 +1750,11 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       };
 
       if (ioctl(dev->fd, KBASE_IOCTL_MEM_ALLOC, &req)) {
-         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s", strerror(errno));
+         mesa_loge("kbase: KBASE_IOCTL_MEM_ALLOC failed: %s%s", strerror(errno),
+                   (kmod_flags & PAN_KMOD_BO_FLAG_EXECUTABLE)
+                      ? " (executable allocation; EXEC_VA zone may be "
+                        "unusable despite the earlier ready check)"
+                      : "");
          goto err_free_bo;
       }
 
@@ -1723,14 +1789,22 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
    kbase_bo->gpu_mapping = cpu_ptr;
    kbase_bo->gpu_va = kbase_bo->same_va ? (uintptr_t)cpu_ptr : alloc_gpu_va;
 
-   mesa_logi("%s: successfully allocated gpu_va=%" PRIx64 " cpu=%p size=%zu",
-             __func__, kbase_bo->gpu_va, kbase_bo->cpu_ptr, kbase_bo->base.size);
-
    /* Allocate a unique u32 handle for the pan_kmod handle_to_bo table. */
    uint32_t handle = p_atomic_inc_return(&kbase_dev->next_handle);
 
+   /* pan_kmod_bo_init() is what sets kbase_bo->base.size; the alloc-summary
+    * log below must run after this call, otherwise base.size still reads
+    * as whatever was left in the freshly allocated (possibly zeroed)
+    * kbase_bo struct and every allocation is logged as size=0 regardless
+    * of how large it actually is. Log va_pages * page_size directly (the
+    * true allocated size) rather than depending on ordering at all. */
    pan_kmod_bo_init(&kbase_bo->base, dev, exclusive_vm,
                     va_pages * page_size, kmod_flags, handle);
+
+   mesa_logi("%s: successfully allocated gpu_va=%" PRIx64 " cpu=%p size=%"
+             PRIu64, __func__, kbase_bo->gpu_va, kbase_bo->cpu_ptr,
+             va_pages * page_size);
+
    return &kbase_bo->base;
 
 err_free_bo:
