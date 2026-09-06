@@ -1,4 +1,3 @@
-/*kbase_mem_probe2.c
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
