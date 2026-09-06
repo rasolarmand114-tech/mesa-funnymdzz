@@ -1,7 +1,7 @@
 /*
  * Copyright © 2026 Collabora, Ltd.
  * SPDX-License-Identifier: MIT
- *
+ *kbase_kmod.c
  * kmod backend for the ARM Mali kbase kernel driver (/dev/mali*).
  * Targets the Bifrost/Valhall kbase driver r32p0–r44p0, both the JM
  * (arch <= 9, uAPI 11.x) and CSF (arch >= 10, uAPI 1.x) flavours.
