@@ -1182,13 +1182,13 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    bool is_csf = false;
 
    /* Some kernels answer an unimplemented/reserved ioctl number with
-    * success and a zeroed struct instead of -ENOTTY/-EPERM. On a JM-flavour
-    * kbase, ioctl nr 52 (the CSF VERSION_CHECK number) is exactly such a
-    * reserved slot (see KBASE_IOCTL_VERSION_CHECK_RESERVED). Trusting only
-    * the return code here would misclassify a JM part as CSF and send it
-    * down CS_*/queue-group code paths the kernel doesn't implement, so also
-    * require a plausible non-zero major version before believing the CSF
-    * probe succeeded. */
+ * success and a zeroed struct instead of -ENOTTY/-EPERM. On a JM-flavour
+ * kbase, ioctl nr 52 (the CSF VERSION_CHECK number) is exactly such a
+ * reserved slot (see KBASE_IOCTL_VERSION_CHECK_RESERVED). Trusting only
+ * the return code here would misclassify a JM part as CSF and send it
+ * down CSF/queue-group code paths the kernel doesn't implement, so also
+ * require a plausible non-zero major version before believing the CSF
+ * probe succeeded. */
    if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0 && ver.major != 0) {
       is_csf = true;
    } else {
