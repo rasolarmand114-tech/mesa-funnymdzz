@@ -1,7 +1,7 @@
 /*
  * Copyright © 2026 Collabora, Ltd.
  * SPDX-License-Identifier: MIT
- *kbase_kmod.c
+ *
  * kmod backend for the ARM Mali kbase kernel driver (/dev/mali*).
  * Targets the Bifrost/Valhall kbase driver r32p0–r44p0, both the JM
  * (arch <= 9, uAPI 11.x) and CSF (arch >= 10, uAPI 1.x) flavours.
@@ -887,7 +887,13 @@ kbase_kmod_csf_wait_cqs64(struct pan_kmod_dev *dev, uint64_t addr,
    STATIC_ASSERT(sizeof(struct base_cqs_wait_operation_info) == 24);
    STATIC_ASSERT(sizeof(struct base_kcpu_command) == 24);
 
-   if (!kbase_dev->is_csf || (addr & 15))
+   /* Use the same CSF/JM classifier as every other CSF-only entry point
+    * (KBASE_REQUIRE_CSF_DEVICE) instead of reading kbase_dev->is_csf
+    * directly here -- two different sources of truth for the same
+    * question is exactly the kind of divergence that lets a JM device
+    * slip into a CSF-only code path (or vice versa) in one function but
+    * not another. */
+   if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_CSF || (addr & 15))
       return -1;
 
    simple_mtx_lock(&kbase_dev->kcpu.lock);
@@ -1175,22 +1181,34 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
    struct kbase_ioctl_version_check ver = { 0 };
    bool is_csf = false;
 
-   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0) {
+   /* Some kernels answer an unimplemented/reserved ioctl number with
+    * success and a zeroed struct instead of -ENOTTY/-EPERM. On a JM-flavour
+    * kbase, ioctl nr 52 (the CSF VERSION_CHECK number) is exactly such a
+    * reserved slot (see KBASE_IOCTL_VERSION_CHECK_RESERVED). Trusting only
+    * the return code here would misclassify a JM part as CSF and send it
+    * down CS_*/queue-group code paths the kernel doesn't implement, so also
+    * require a plausible non-zero major version before believing the CSF
+    * probe succeeded. */
+   if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_CSF, &ver) == 0 && ver.major != 0) {
       is_csf = true;
-   } else if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_JM, &ver) == 0) {
-      is_csf = false;
+   } else {
+      ver = (struct kbase_ioctl_version_check){ 0 };
 
-      if (ver.major < 11) {
-         mesa_loge("kbase: legacy JM driver version %d.%d not supported "
-                   "(need >= 11.0)", ver.major, ver.minor);
+      if (ioctl(fd, KBASE_IOCTL_VERSION_CHECK_JM, &ver) == 0 && ver.major != 0) {
+         is_csf = false;
+
+         if (ver.major < 11) {
+            mesa_loge("kbase: legacy JM driver version %d.%d not supported "
+                      "(need >= 11.0)", ver.major, ver.minor);
+            return NULL;
+         }
+      } else {
+         /* Not a usable kbase fd (or a device node we can't handshake
+          * with). This is an expected outcome when probing device nodes,
+          * so keep it quiet. */
+         mesa_logd("kbase: version handshake rejected: %s", strerror(errno));
          return NULL;
       }
-   } else {
-      /* Not a usable kbase fd (or a device node we can't handshake with).
-       * This is an expected outcome when probing device nodes, so keep it
-       * quiet. */
-      mesa_logd("kbase: version handshake rejected: %s", strerror(errno));
-      return NULL;
    }
 
    mesa_logd("kbase: %s driver, uAPI version %d.%d",
@@ -1242,13 +1260,29 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
 
    /* Initialise the EXEC_VA zone so that GPU-executable allocations
     * (shader BOs) are possible.  4G of executable VA (0x100000 pages)
-    * matches what panfork uses.  On CSF uAPI >= 1.9 the zone is set up
-    * automatically and this is a no-op.  Failure is not fatal for
-    * enumeration, but executable allocations will fail later, so warn. */
-   struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
-   if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
-      mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
-                "(executable BO allocation will not work)", strerror(errno));
+    * matches what panfork uses.
+    *
+    * On CSF uAPI >= 1.9 the kernel carves out EXEC_VA automatically when
+    * the context is created, and calling this ioctl again is rejected with
+    * -EPERM ("zone already initialised") -- that is expected, not an
+    * error. Calling it unconditionally regardless of flavour/version, as
+    * before, means that expected -EPERM and a genuine failure on a
+    * flavour/version that *does* need the explicit call (JM, or CSF < 1.9)
+    * both print the exact same warning, which is what made the JM failure
+    * on this device look like "normal" CSF behaviour in the log. Skip the
+    * call in the auto-init case so a real failure elsewhere is unambiguous. */
+   bool csf_auto_exec_va =
+      is_csf && (ver.major > 1 || (ver.major == 1 && ver.minor >= 9));
+
+   if (!csf_auto_exec_va) {
+      struct kbase_ioctl_mem_exec_init exec_init = { .va_pages = 0x100000 };
+      if (ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &exec_init)) {
+         mesa_logw("kbase: KBASE_IOCTL_MEM_EXEC_INIT failed: %s "
+                   "(executable BO allocation will not work)", strerror(errno));
+      }
+   } else {
+      mesa_logd("kbase: CSF uAPI %d.%d auto-initialises EXEC_VA, skipping "
+                "KBASE_IOCTL_MEM_EXEC_INIT", ver.major, ver.minor);
    }
 
    struct kbase_kmod_dev *kbase_dev =
@@ -2006,5 +2040,5 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .vm_bind                = kbase_kmod_vm_bind,
    .vm_query_state         = kbase_kmod_vm_query_state,
    .query_timestamp        = kbase_kmod_query_timestamp,
-   .bo_set_label           = kbase_kmod_bo_set_label,
+   .bo_set_label            = kbase_kmod_bo_set_label,
 };
