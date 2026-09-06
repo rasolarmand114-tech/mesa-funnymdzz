@@ -77,8 +77,16 @@
    void panvk_v##_ver##_destroy_device(                                        \
       struct panvk_device *device, const VkAllocationCallbacks *pAllocator)
 
+/* NOTE (patch): v9 declaration added below to support Mali-G57 / Mali-G62
+ * (Valhall gen-1, Job-Manager based, same dispatch family as v6/v7). The
+ * matching panvk_v9_*() implementations must exist in a panvk_v9_device.c
+ * (or similar) generated the same way as the v6/v7 ones, and gen_macros.h /
+ * panvk_arch_dispatch must be taught about "9" as well -- neither of those
+ * files were provided, so only the plumbing that lives in this file is
+ * patched here. */
 PER_ARCH_FUNCS(6);
 PER_ARCH_FUNCS(7);
+PER_ARCH_FUNCS(9);
 PER_ARCH_FUNCS(10);
 PER_ARCH_FUNCS(12);
 PER_ARCH_FUNCS(13);
@@ -1203,6 +1211,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 9:
    case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -1333,6 +1342,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 9:
    case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
