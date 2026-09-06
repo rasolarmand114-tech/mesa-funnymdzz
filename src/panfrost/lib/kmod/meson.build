@@ -8,7 +8,6 @@ libpankmod_lib_files = files(
   'kbase_mem_probe.c',
   'kbase_mem_probe2.c',
   'kbase_submit_probe.c',
-  'kbase_probe.c',
 )
 
 if panfrost_kmds.contains('panfrost')
