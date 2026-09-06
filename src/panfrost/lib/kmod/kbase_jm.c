@@ -61,7 +61,7 @@
 #include "drm-uapi/mali_kbase_ioctl.h"
 #include "drm-uapi/mali_base_kernel.h"
 #include "drm-uapi/mali_base_jm_kernel.h"
-#include "drm-uapi/jm/mali_kbase_jm_ioctl.h"
+#include "drm-uapi/mali_kbase_jm_ioctl.h"
 
 #include "kbase_kmod.h"
 #include "kbase_jm.h"
