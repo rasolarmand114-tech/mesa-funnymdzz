@@ -58,10 +58,10 @@
 #include "util/log.h"
 #include "util/macros.h"
 
-#include "drm-uapi/mali_kbase_ioctl.h"
-#include "drm-uapi/mali_base_kernel.h"
-#include "drm-uapi/mali_base_jm_kernel.h"
-#include "drm-uapi/mali_kbase_jm_ioctl.h"
+#include "mali_kbase_ioctl.h"
+#include "mali_base_kernel.h"
+#include "mali_base_jm_kernel.h"
+#include "mali_kbase_jm_ioctl.h"
 
 #include "kbase_kmod.h"
 #include "kbase_jm.h"
