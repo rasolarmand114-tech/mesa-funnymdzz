@@ -3,47 +3,6 @@
  *
  * kbase_jm.c — Job Manager (JM) command-submission backend for the ARM Mali
  * kbase kmod driver (/dev/mali*).
- *
- * WHAT THIS FILE IS
- * ------------------
- * kbase_kmod.c already implements device enumeration, memory management,
- * and the CSF (arch >= 10) queue-group / queue / tiler-heap submission path
- * (kbase_kmod_csf_group_create / _queue_bind / _queue_kick / _wait_event),
- * but explicitly leaves JM (arch <= 9) command submission unimplemented
- * (see the header comment in kbase_kmod.c: "Command submission (CSF queue
- * groups / JM job atoms) is not wired up yet").
- *
- * This file fills in the missing half: JM job-atom submission, job-slot
- * (JS_PRESENT / JS_FEATURES_n register) introspection, and JM completion-
- * event handling.
- *
- * WHAT THIS FILE IS NOT
- * ----------------------
- * - It does not modify kbase_kmod.c or kbase_kmod.h.
- * - It does not read, call, or re-implement any CSF ioctl, register, or
- *   data structure. CSF submission keeps going exclusively through
- *   kbase_kmod_csf_* in kbase_kmod.c.
- * - The only thing shared between the two paths is the device handle
- *   (struct pan_kmod_dev *) and the read-only kbase_gfx_dev_kind() probe
- *   below, which every public function in this file calls first to refuse
- *   to touch a CSF device.
- *
- * ABI note
- * --------
- * Built against the real jm/mali_kbase_jm_ioctl.h (uAPI 11.46). Two extra
- * ioctls from that header are used besides KBASE_IOCTL_JOB_SUBMIT:
- *   - KBASE_IOCTL_SOFT_EVENT_UPDATE (nr 28): CPU-side set/reset of a
- *     BASE_JD_REQ_SOFT_EVENT_WAIT/SET/RESET soft-job's event, exposed here
- *     as kbase_jm_soft_event_update().
- *   - KBASE_IOCTL_POST_TERM (nr 4): wakes up a blocked reader on this fd at
- *     context teardown, exposed here as kbase_jm_post_term().
- * Note that this header's KBASE_IOCTL_VERSION_CHECK (nr 0) is what
- * kbase_kmod.c calls KBASE_IOCTL_VERSION_CHECK_JM, and its
- * KBASE_IOCTL_VERSION_CHECK_RESERVED (nr 52) is deliberately the same
- * ioctl number the CSF header uses for its *real* version-check request —
- * that collision is exactly what makes the CSF/JM handshake probe in
- * kbase_kmod_dev_create() reliable (each flavour's kernel driver rejects
- * the other flavour's version-check number with -EPERM).
  */
 
 #include <assert.h>
@@ -66,26 +25,8 @@
 #include "kbase_kmod.h"
 #include "kbase_jm.h"
 
-/* pan_kmod_dev / pan_kmod_driver_version_at_least() live here. */
 #include "pan_kmod.h"
 
-/* -------------------------------------------------------------------------
- * Section 0 — CSF vs JM device-kind probe
- *
- * This is the "check which device we have, then choose the branch" step
- * the two command-submission families are dispatched from. It is derived
- * purely from the public struct pan_kmod_dev::driver.version that
- * kbase_kmod_dev_create() already fills in from the VERSION_CHECK
- * handshake (CSF reports uAPI 1.x, JM reports uAPI 11.x — see the
- * handshake comment at the top of kbase_kmod.c). No private field of
- * kbase_kmod.c's internal struct kbase_kmod_dev is touched, and no ioctl
- * is re-issued.
- * ---------------------------------------------------------------------- */
-
-/* Declared with external linkage in kbase_kmod.c (the definition sits at
- * the bottom of that file); referenced here only to assert that a
- * pan_kmod_dev really was created by the kbase backend before we trust its
- * ->driver.version to mean what kbase means by it. */
 extern const struct pan_kmod_ops kbase_kmod_ops;
 
 enum kbase_gfx_dev_kind
@@ -94,10 +35,6 @@ kbase_gfx_dev_kind(const struct pan_kmod_dev *dev)
    if (!dev || dev->ops != &kbase_kmod_ops)
       return KBASE_GFX_DEV_UNKNOWN;
 
-   /* Values match the handshake in kbase_kmod_dev_create(): the CSF ABI is
-    * versioned 1.x, the JM ABI (kbase_kmod.c rejects anything older) is
-    * versioned >= 11.x. These two ranges never overlap, so a plain
-    * major-version test is sufficient and cannot misclassify. */
    if (dev->driver.version.major == 1)
       return KBASE_GFX_DEV_CSF;
 
@@ -107,9 +44,6 @@ kbase_gfx_dev_kind(const struct pan_kmod_dev *dev)
    return KBASE_GFX_DEV_UNKNOWN;
 }
 
-/* Every public entry point in this file starts with this guard. Kept as a
- * macro (rather than a helper returning bool) so the caller's own return
- * statement/value stays visible at the call site. */
 #define KBASE_JM_REQUIRE_JM_DEVICE(dev, ret_on_fail)                        \
    do {                                                                     \
       if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_JM) {                    \
@@ -120,15 +54,6 @@ kbase_gfx_dev_kind(const struct pan_kmod_dev *dev)
       }                                                                     \
    } while (0)
 
-/* -------------------------------------------------------------------------
- * Section 1 — GPU-properties helper (self-contained: does not call any
- * static helper from kbase_kmod.c)
- * ---------------------------------------------------------------------- */
-
-/* Same little TLV format KBASE_IOCTL_GET_GPUPROPS returns, documented next
- * to kbase_kmod.c's own (static, private) copy of this parser:
- *   4-byte header (key << 2) | size_code, followed by 1/2/4/8 bytes of
- *   value depending on size_code. */
 static uint64_t
 kbase_jm_gpuprop_get(const uint8_t *buf, size_t buf_size,
                      uint32_t target_key, uint64_t default_val)
@@ -194,14 +119,8 @@ kbase_jm_get_gpuprops(int fd, size_t *out_size)
    return buf;
 }
 
-/* KBASE_GPUPROP_RAW_JS_* keys (from kbase_uapi.h): JS_PRESENT is 34,
- * JS_FEATURES_0..15 are 35..50 (one raw hardware register each). */
 #define KBASE_JM_GPUPROP_RAW_JS_PRESENT      34
 #define KBASE_JM_GPUPROP_RAW_JS_FEATURES_0   35
-
-/* -------------------------------------------------------------------------
- * Section 2 — Job-slot (JS_PRESENT / JS_FEATURES_n) introspection
- * ---------------------------------------------------------------------- */
 
 int
 kbase_jm_query_job_slots(struct pan_kmod_dev *dev,
@@ -216,9 +135,6 @@ kbase_jm_query_job_slots(struct pan_kmod_dev *dev,
    if (!props)
       return -1;
 
-   /* JS_PRESENT is a bitmask: bit n set means job slot n exists. This is
-    * the literal hardware JS_PRESENT register value, not a derived count,
-    * so a slot count on real hardware line up 1:1 with popcount(). */
    uint32_t js_present =
       (uint32_t)kbase_jm_gpuprop_get(props, props_size,
                                      KBASE_JM_GPUPROP_RAW_JS_PRESENT, 0);
@@ -255,9 +171,6 @@ kbase_jm_query_job_slots(struct pan_kmod_dev *dev,
    return 0;
 }
 
-/* Picks the lowest-numbered job slot whose JS_FEATURES_n register
- * advertises every capability bit @required. Returns the slot index, or
- * -1 if no slot qualifies. */
 static int
 kbase_jm_pick_slot(const struct kbase_jm_job_slot_info *slots,
                    uint32_t required)
@@ -269,16 +182,6 @@ kbase_jm_pick_slot(const struct kbase_jm_job_slot_info *slots,
    return -1;
 }
 
-/* -------------------------------------------------------------------------
- * Section 3 — Atom submission
- * ---------------------------------------------------------------------- */
-
-/* Monotonic atom-id allocator. kbase JM atom ids are a per-fd __u8
- * namespace (BASE_JD_ATOM_COUNT = 256); id 0 is reserved by this module to
- * mean "no dependency" (see kbase_jm_atom_desc::depends_on_atom), so the
- * usable range is 1..255 and then wraps. Atom-id lifetime/exhaustion
- * tracking is the caller's responsibility once a real submission queue
- * with many in-flight atoms is built on top of this. */
 static uint8_t next_atom_id = 1;
 
 static base_jd_core_req
@@ -292,7 +195,7 @@ kbase_jm_core_req_for_kind(enum kbase_jm_atom_kind kind)
    case KBASE_JM_ATOM_COMPUTE:
       return BASE_JD_REQ_CS | BASE_JD_REQ_ONLY_COMPUTE;
    }
-   unreachable("invalid kbase_jm_atom_kind");
+   UNREACHABLE("invalid kbase_jm_atom_kind");
 }
 
 static uint32_t
@@ -306,7 +209,7 @@ kbase_jm_required_js_features(enum kbase_jm_atom_kind kind)
    case KBASE_JM_ATOM_COMPUTE:
       return KBASE_JM_JSn_FEATURE_COMPUTE;
    }
-   unreachable("invalid kbase_jm_atom_kind");
+   UNREACHABLE("invalid kbase_jm_atom_kind");
 }
 
 static base_jd_prio
@@ -318,7 +221,7 @@ kbase_jm_base_prio(enum kbase_jm_atom_priority prio)
    case KBASE_JM_PRIO_MEDIUM:   return BASE_JD_PRIO_MEDIUM;
    case KBASE_JM_PRIO_LOW:      return BASE_JD_PRIO_LOW;
    }
-   unreachable("invalid kbase_jm_atom_priority");
+   UNREACHABLE("invalid kbase_jm_atom_priority");
 }
 
 int
@@ -344,7 +247,7 @@ kbase_jm_atom_submit(struct pan_kmod_dev *dev,
    }
 
    uint8_t atom_id = next_atom_id++;
-   if (next_atom_id == 0) /* keep 0 reserved for "no dependency" */
+   if (next_atom_id == 0)
       next_atom_id = 1;
 
    base_jd_atom atom = {
@@ -356,8 +259,6 @@ kbase_jm_atom_submit(struct pan_kmod_dev *dev,
       .jobslot = (uint8_t)jobslot,
    };
 
-   /* BASE_JD_REQ_JOB_SLOT is required for the .jobslot field above to be
-    * honoured instead of left to the scheduler's own placement. */
    atom.core_req |= BASE_JD_REQ_JOB_SLOT;
 
    if (desc->depends_on_atom != 0) {
@@ -384,17 +285,6 @@ kbase_jm_atom_submit(struct pan_kmod_dev *dev,
    return atom_id;
 }
 
-/* -------------------------------------------------------------------------
- * Section 4 — Completion events
- *
- * JM reports job completion by making the kbase fd readable and returning
- * an array of struct base_jd_event_v2 from read(), one entry per completed
- * atom (this is the JM analogue of the CSF notification stream that
- * kbase_kmod_csf_wait_event() polls -- the two payloads are not
- * interchangeable, which is why this is a separate function rather than a
- * shared one).
- * ---------------------------------------------------------------------- */
-
 int
 kbase_jm_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns,
                     uint8_t *out_atom_number, bool *out_succeeded)
@@ -410,7 +300,7 @@ kbase_jm_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns,
       return -1;
    }
    if (pret == 0)
-      return 0; /* timeout, no event */
+      return 0;
 
    struct base_jd_event_v2 event;
    ssize_t n = read(dev->fd, &event, sizeof(event));
@@ -436,10 +326,6 @@ kbase_jm_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns,
    return 1;
 }
 
-/* -------------------------------------------------------------------------
- * Section 5 — Soft-events (KBASE_IOCTL_SOFT_EVENT_UPDATE)
- * ---------------------------------------------------------------------- */
-
 int
 kbase_jm_soft_event_update(struct pan_kmod_dev *dev, uint64_t event_gpu_va,
                            enum kbase_jm_soft_event_status status)
@@ -447,9 +333,6 @@ kbase_jm_soft_event_update(struct pan_kmod_dev *dev, uint64_t event_gpu_va,
    KBASE_JM_REQUIRE_JM_DEVICE(dev, -1);
 
    if (event_gpu_va & 0x7) {
-      /* BASE_JD_REQ_SOFT_EVENT_* jobs read/write the event as a naturally
-       * aligned word; an unaligned address is always a caller bug, so
-       * catch it here instead of letting the kernel refuse it later. */
       mesa_loge("kbase_jm: soft-event address 0x%" PRIx64 " is not aligned",
                 event_gpu_va);
       errno = EINVAL;
@@ -474,10 +357,6 @@ kbase_jm_soft_event_update(struct pan_kmod_dev *dev, uint64_t event_gpu_va,
 
    return 0;
 }
-
-/* -------------------------------------------------------------------------
- * Section 6 — Context teardown notification (KBASE_IOCTL_POST_TERM)
- * ---------------------------------------------------------------------- */
 
 int
 kbase_jm_post_term(struct pan_kmod_dev *dev)
