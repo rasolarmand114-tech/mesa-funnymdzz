@@ -56,12 +56,30 @@
 #include "drm-uapi/panthor_drm.h"
 
 #include "kbase_kmod.h"
+#include "kbase_jm.h"
 #include "pan_kmod_backend.h"
 #include "pan_props.h"
 #include "pan_trace.h"
 
 /* Forward declaration — the full definition is at the end of this file. */
 const struct pan_kmod_ops kbase_kmod_ops;
+
+/* Mirrors KBASE_JM_REQUIRE_JM_DEVICE (kbase_jm.c): every entry point below
+ * that issues a CSF-only ioctl (KBASE_IOCTL_CS_*) must refuse to run on a
+ * JM device instead of relying on kbase_gfx_dev_kind() classifying based on
+ * the version handshake alone. Without this, calling a CSF primitive on a
+ * JM part silently sends a CS_* ioctl to a kernel that doesn't implement it,
+ * which is a confusing way to fail. This check is unconditional (not an
+ * assert), so it also fires in release/NDEBUG builds. */
+#define KBASE_REQUIRE_CSF_DEVICE(dev, ret_on_fail)                          \
+   do {                                                                     \
+      if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_CSF) {                   \
+         mesa_loge("kbase: refusing to run a CSF-only operation on a "      \
+                   "non-CSF (JM or unrecognised) device");                 \
+         errno = ENOTSUP;                                                   \
+         return (ret_on_fail);                                             \
+      }                                                                     \
+   } while (0)
 
 /* -------------------------------------------------------------------------
  * Internal device / BO / VM objects
@@ -472,11 +490,11 @@ const struct drm_panthor_csif_info *
 kbase_kmod_get_csif_props(const struct pan_kmod_dev *dev)
 {
    assert(dev->ops == &kbase_kmod_ops);
+   KBASE_REQUIRE_CSF_DEVICE(dev, NULL);
 
    struct kbase_kmod_dev *kbase_dev =
       container_of(dev, struct kbase_kmod_dev, base);
 
-   assert(kbase_dev->is_csf);
    return &kbase_dev->csif_info;
 }
 
@@ -501,6 +519,8 @@ int
 kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
                             uint32_t *group_handle)
 {
+   KBASE_REQUIRE_CSF_DEVICE(dev, -1);
+
    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create_1_18) == 40);
    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create) == 112);
 
@@ -669,6 +689,12 @@ kbase_log_csf_notification(struct pan_kmod_dev *dev,
 void
 kbase_kmod_csf_group_destroy(struct pan_kmod_dev *dev, uint32_t group_handle)
 {
+   if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_CSF) {
+      mesa_loge("kbase: refusing to run a CSF-only operation on a non-CSF "
+                "(JM or unrecognised) device");
+      return;
+   }
+
    struct kbase_ioctl_cs_queue_group_term req = {
       .group_handle = group_handle,
    };
@@ -683,6 +709,8 @@ kbase_kmod_csf_queue_bind(struct pan_kmod_dev *dev, uint32_t group_handle,
                           uint32_t csi_index, uint64_t ringbuf_va,
                           uint32_t ringbuf_size)
 {
+   KBASE_REQUIRE_CSF_DEVICE(dev, NULL);
+
    struct kbase_ioctl_cs_queue_register reg = {
       .buffer_gpu_addr = ringbuf_va,
       .buffer_size = ringbuf_size,
@@ -736,6 +764,12 @@ void
 kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
                           void *user_io)
 {
+   if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_CSF) {
+      mesa_loge("kbase: refusing to run a CSF-only operation on a non-CSF "
+                "(JM or unrecognised) device");
+      return;
+   }
+
    if (user_io)
       munmap(user_io, BASEP_QUEUE_NR_MMAP_USER_PAGES * 4096);
 
@@ -751,6 +785,8 @@ kbase_kmod_csf_queue_term(struct pan_kmod_dev *dev, uint64_t ringbuf_va,
 int
 kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
 {
+   KBASE_REQUIRE_CSF_DEVICE(dev, -1);
+
    struct kbase_ioctl_cs_queue_kick kick = {
       .buffer_gpu_addr = ringbuf_va,
    };
@@ -767,6 +803,8 @@ kbase_kmod_csf_queue_kick(struct pan_kmod_dev *dev, uint64_t ringbuf_va)
 int
 kbase_kmod_csf_wait_event(struct pan_kmod_dev *dev, int64_t timeout_ns)
 {
+   KBASE_REQUIRE_CSF_DEVICE(dev, -1);
+
    /* Block until the kernel has a CSF notification pending, then consume one
     * notification with read().  This is what drives kernel-side
     * servicing of the submitted work (tiler-heap OOM growth, sync-update
@@ -997,6 +1035,8 @@ kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                  uint64_t *heap_ctx_va,
                                  uint64_t *first_chunk_va)
 {
+   KBASE_REQUIRE_CSF_DEVICE(dev, -1);
+
    /* The uAPI group_id is the physical memory group used for allocations,
     * not the CS queue group handle. */
    union kbase_ioctl_cs_tiler_heap_init req = {
@@ -1024,6 +1064,12 @@ void
 kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,
                                   uint64_t heap_ctx_va)
 {
+   if (kbase_gfx_dev_kind(dev) != KBASE_GFX_DEV_CSF) {
+      mesa_loge("kbase: refusing to run a CSF-only operation on a non-CSF "
+                "(JM or unrecognised) device");
+      return;
+   }
+
    struct kbase_ioctl_cs_tiler_heap_term req = {
       .gpu_heap_va = heap_ctx_va,
    };
@@ -1185,7 +1231,7 @@ kbase_kmod_dev_create(int fd, uint32_t flags,
     * panfork's.  Failure is non-fatal for enumeration but breaks tiler
     * heaps, so warn. */
    struct kbase_ioctl_mem_jit_init jit_init = {
-      .va_pages = 1ull << 20 /* PATCH: reduced from panfork's 1<<25 (~128GB VA) - testing if kernel 4.19 rejects oversized JIT VA request */,
+      .va_pages = 1ull << 25, /* matches panfork: ~128GB of JIT/CUSTOM_VA space */
       .max_allocations = 255,
       .phys_pages = 1ull << 20,
    };
