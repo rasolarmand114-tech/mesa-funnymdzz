@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: MIT
 
 libpankmod_lib_files = files(
-  'pan_kmod.c',
+  'pan_kmod.c'
   'kbase_handshake.c'
-  
+  'kbase_jm.c'  
 )
 
 if panfrost_kmds.contains('panfrost')
