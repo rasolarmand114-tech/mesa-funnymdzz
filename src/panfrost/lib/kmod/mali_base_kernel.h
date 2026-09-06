@@ -545,11 +545,19 @@ struct mali_base_gpu_coherent_group_info {
 	struct mali_base_gpu_coherent_group group[BASE_MAX_COHERENT_GROUPS];
 };
 
-// #if MALI_USE_CSF
+/*
+ * BUILD FIX: this backend (kbase_kmod.c + kbase_jm.c) compiles BOTH the
+ * CSF and JM command-submission flavours into the same library, selecting
+ * between them at *runtime* via kbase_gfx_dev_kind() rather than at compile
+ * time via a single MALI_USE_CSF macro. The original commented-out
+ * conditional below only ever activated the CSF include, which left
+ * `struct mali_base_gpu_core_props` (used a few lines down inside
+ * `struct base_gpu_props`) undefined, since that struct only exists in
+ * mali_base_jm_kernel.h. Both headers below have their own include guards,
+ * so including both unconditionally is safe.
+ */
 #include "mali_base_csf_kernel.h"
-// #else
-// #include "jm/mali_base_jm_kernel.h"
-// #endif
+#include "mali_base_jm_kernel.h"
 
 /**
  * struct gpu_raw_gpu_props - A complete description of the GPU's Hardware
