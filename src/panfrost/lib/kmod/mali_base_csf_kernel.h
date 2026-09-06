@@ -552,45 +552,4 @@ struct base_csf_notification {
 	} payload;
 };
 
-/**
- * struct mali_base_gpu_core_props - GPU core props info
- *
- * @product_id: Pro specific value.
- * @version_status: Status of the GPU release. No defined values, but starts at
- *   0 and increases by one for each release status (alpha, beta, EAC, etc.).
- *   4 bit values (0-15).
- * @minor_revision: Minor release number of the GPU. "P" part of an "RnPn"
- *   release number.
- *   8 bit values (0-255).
- * @major_revision: Major release number of the GPU. "R" part of an "RnPn"
- *   release number.
- *   4 bit values (0-15).
- * @padding: padding to align to 8-byte
- * @gpu_freq_khz_max: The maximum GPU frequency. Reported to applications by
- *   clGetDeviceInfo()
- * @log2_program_counter_size: Size of the shader program counter, in bits.
- * @texture_features: TEXTURE_FEATURES_x registers, as exposed by the GPU. This
- *   is a bitpattern where a set bit indicates that the format is supported.
- *   Before using a texture format, it is recommended that the corresponding
- *   bit be checked.
- * @gpu_available_memory_size: Theoretical maximum memory available to the GPU.
- *   It is unlikely that a client will be able to allocate all of this memory
- *   for their own purposes, but this at least provides an upper bound on the
- *   memory available to the GPU.
- *   This is required for OpenCL's clGetDeviceInfo() call when
- *   CL_DEVICE_GLOBAL_MEM_SIZE is requested, for OpenCL GPU devices. The
- *   client will not be expecting to allocate anywhere near this value.
- */
-struct mali_base_gpu_core_props {
-	__u32 product_id;
-	__u16 version_status;
-	__u16 minor_revision;
-	__u16 major_revision;
-	__u16 padding;
-	__u32 gpu_freq_khz_max;
-	__u32 log2_program_counter_size;
-	__u32 texture_features[BASE_GPU_NUM_TEXTURE_FEATURES_REGISTERS];
-	__u64 gpu_available_memory_size;
-};
-
 #endif /* _UAPI_BASE_CSF_KERNEL_H_ */
