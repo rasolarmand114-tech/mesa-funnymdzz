@@ -23,7 +23,7 @@
 #define _UAPI_BASE_JM_KERNEL_H_
 
 #include <linux/types.h>
-#include "../mali_base_common_kernel.h"
+#include "mali_base_common_kernel.h"
 
 /* Memory allocation, access/hint flags & mask specific to JM GPU.
  *
