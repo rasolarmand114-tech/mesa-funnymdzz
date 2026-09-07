@@ -44,6 +44,22 @@ struct panvk_gpu_queue {
     * panvk_per_arch(create_gpu_queue)().
     */
    uint8_t jm_last_atom;
+
+   /* Job slot index (into this device's kbase JS_FEATURES table) that
+    * vertex+tiler atoms are routed to. Resolved once at queue creation
+    * time in panvk_per_arch(create_gpu_queue)() via
+    * panvk_kbase_pick_job_slot(), since slot routing is now an explicit
+    * per-atom field (struct kbase_jm_atom_desc::jobslot) instead of
+    * being implied by core_req flags the way the raw kbase ioctl ABI
+    * used to work. A negative value should never be observed outside of
+    * queue construction: create_gpu_queue() fails device creation if no
+    * slot advertising the required features is found. */
+   int jm_vt_slot;
+
+   /* Same as jm_vt_slot, but for fragment atoms (KBASE_JM_ATOM_FRAGMENT).
+    * Picked independently since vertex+tiler and fragment work can (and
+    * typically do) land on different job slots. */
+   int jm_frag_slot;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
