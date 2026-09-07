@@ -37,12 +37,20 @@
 #include "vk_sync.h"
 
 /* Which JM job slot a kbase atom lands on is picked from its core_req
- * flags, not passed explicitly: no flags (0) goes to slot 0, which is what
- * Panfrost-style combined vertex+tiler job chains want; BASE_JD_REQ_FS
- * marks a fragment-only job chain and routes it to slot 2. See
- * kbase_js_choose_affinity()/kbasep_js_...  in mali_kbase_js.c of the
+ * flags: BASE_JD_REQ_CS | BASE_JD_REQ_T (vertex/tiler work) routes to the
+ * slot whose JS_FEATURES advertise VERTEX+TILER, and BASE_JD_REQ_FS marks
+ * a fragment-only job chain and routes it to the FRAGMENT-capable slot.
+ * See kbase_js_choose_affinity()/kbasep_js_... in mali_kbase_js.c of the
  * linked kernel tree for the actual slot-selection logic this is
  * mirroring.
+ *
+ * Note core_req == 0 is BASE_JD_REQ_DEP ("No requirement, dependency
+ * only" -- see base_jd_core_req in mali_base_jm_kernel.h): the kernel
+ * treats an atom with no HW requirement bits set as a pure dependency
+ * barrier and will not run it against the job chain pointed to by `jc`
+ * at all, and rejects the submission outright when `jc` is non-zero as
+ * on this device. A real vertex+tiler job chain must therefore declare
+ * BASE_JD_REQ_CS | BASE_JD_REQ_T, not 0.
  */
 enum panvk_kbase_atom_kind {
    PANVK_KBASE_ATOM_VERTEX_TILER,
@@ -78,7 +86,9 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
 
    struct base_jd_atom_v2 atom = {
       .jc = jc,
-      .core_req = kind == PANVK_KBASE_ATOM_FRAGMENT ? BASE_JD_REQ_FS : 0,
+      .core_req = kind == PANVK_KBASE_ATOM_FRAGMENT
+                     ? BASE_JD_REQ_FS
+                     : (BASE_JD_REQ_CS | BASE_JD_REQ_T),
       .atom_number = atom_number,
       .prio = BASE_JD_PRIO_MEDIUM,
    };
