@@ -85,7 +85,7 @@ fifthgen_archs = [12, 13, 14]
 fifthgen_inc_dir = ['fifthgen']
 fifthgen_files = []
 
-jm_archs = [6, 7]
+jm_archs = [6, 7, 9]
 jm_inc_dir = ['jm']
 jm_files = [
   'jm/panvk_vX_cmd_buffer.c',
