@@ -18,7 +18,30 @@
 
 struct panvk_gpu_queue {
    struct vk_queue vk;
-   uint32_t sync;
+
+   /* HW atom id of the most recently submitted kbase JM atom on this queue
+    * (0 == none submitted yet). Passed as
+    * kbase_jm_atom_desc::depends_on_atom for the next atom we submit, so
+    * completion order always matches submission order.
+    *
+    * kbase_jm_atom_desc only supports a single explicit predecessor and
+    * completion is only ever reported asynchronously via a poll()+read()
+    * event stream on the device fd (kbase_jm_wait_event()) -- there is no
+    * DRM syncobj/fence to hook external waiters into. Rather than run a
+    * background thread to demultiplex that event stream, this queue uses a
+    * fully synchronous submission model: panvk_per_arch(gpu_queue_submit)()
+    * blocks until every atom it submits has completed before returning.
+    * That keeps this struct (and QueueWaitIdle) trivial, at the cost of not
+    * overlapping consecutive vkQueueSubmit()s on this queue. If that
+    * overlap ever matters, this is the field to grow into a proper
+    * in-flight tracker.
+    *
+    * This also assumes a single panvk_gpu_queue per VkDevice: Mali JM
+    * hardware only exposes one job-manager submission context per kbase
+    * fd, matching the existing "no queue priorities" limitation in
+    * panvk_per_arch(create_gpu_queue)().
+    */
+   uint8_t jm_last_atom;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
