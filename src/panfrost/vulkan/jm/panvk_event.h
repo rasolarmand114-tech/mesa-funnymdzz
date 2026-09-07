@@ -11,7 +11,7 @@
 
 #include "vk_object.h"
 
-#include "kbase_jm.h"
+#include "../../lib/kmod/kbase_jm.h"
 
 struct panvk_priv_bo;
 struct panvk_device;
