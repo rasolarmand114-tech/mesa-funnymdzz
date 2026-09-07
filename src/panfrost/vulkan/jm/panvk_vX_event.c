@@ -3,22 +3,20 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include  "../../lib/kmod/kbase_jm.h"
 #include <errno.h>
 #include <string.h>
-#include <sys/ioctl.h>
 
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_event.h"
-#include "panvk_kbase_fd.h"
-#include "panvk_kbase_uapi.h"
 #include "panvk_priv_bo.h"
 
 #include "util/log.h"
 
 #include "vk_log.h"
 
-/* The soft-event ioctl only ever touches a single status byte, but we give
+/* The soft-event update only ever touches a single status byte, but we give
  * it a whole tiny BO of its own (rather than suballocating out of some
  * shared pool) so panvk_priv_bo_flush()/_invalidate() on it can't stomp on,
  * or be stomped on by, unrelated data sharing the same cacheline. */
@@ -34,28 +32,23 @@ bool
 panvk_per_arch(event_is_set)(const struct panvk_event *event)
 {
    /* The byte we're reading was last written by the kernel (in response to
-    * KBASE_IOCTL_SOFT_EVENT_UPDATE), not by us, so make sure we're not
-    * looking at a stale CPU-cached copy of it. */
+    * a soft-event update), not by us, so make sure we're not looking at a
+    * stale CPU-cached copy of it. */
    panvk_priv_bo_invalidate(event->bo, 0, PANVK_EVENT_BO_SIZE);
 
-   return *panvk_event_status_ptr(event) == (uint8_t)BASE_JD_SOFT_EVENT_SET;
+   return *panvk_event_status_ptr(event) == (uint8_t)KBASE_JM_SOFT_EVENT_SET;
 }
 
 bool
 panvk_per_arch(event_update)(struct panvk_device *dev,
-                             struct panvk_event *event, uint8_t status)
+                             struct panvk_event *event,
+                             enum kbase_jm_soft_event_status status)
 {
-   struct kbase_ioctl_soft_event_update upd = {
-      .event = event->bo->addr.dev,
-      .new_status = status,
-      .flags = 0,
-   };
-
-   int fd = panvk_kbase_raw_fd(dev);
-   int ret = ioctl(fd, KBASE_IOCTL_SOFT_EVENT_UPDATE, &upd);
-   if (ret < 0) {
-      mesa_loge("panvk: KBASE_IOCTL_SOFT_EVENT_UPDATE failed: %s",
-                strerror(errno));
+   int ret = kbase_jm_soft_event_update(dev->kmod.dev, event->bo->addr.dev,
+                                        status);
+   if (ret) {
+      mesa_loge("panvk: kbase_jm_soft_event_update failed: %s",
+                strerror(-ret));
       return false;
    }
 
@@ -85,7 +78,7 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
    /* Start out RESET, same initial state a freshly created (non-SIGNALED)
     * DRM syncobj used to have. */
    if (!panvk_per_arch(event_update)(device, event,
-                                     BASE_JD_SOFT_EVENT_RESET)) {
+                                     KBASE_JM_SOFT_EVENT_RESET)) {
       panvk_priv_bo_unref(event->bo);
       vk_object_free(&device->vk, pAllocator, event);
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -124,7 +117,7 @@ panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   if (!panvk_per_arch(event_update)(device, event, BASE_JD_SOFT_EVENT_SET))
+   if (!panvk_per_arch(event_update)(device, event, KBASE_JM_SOFT_EVENT_SET))
       return VK_ERROR_DEVICE_LOST;
 
    return VK_SUCCESS;
@@ -136,7 +129,7 @@ panvk_per_arch(ResetEvent)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   if (!panvk_per_arch(event_update)(device, event, BASE_JD_SOFT_EVENT_RESET))
+   if (!panvk_per_arch(event_update)(device, event, KBASE_JM_SOFT_EVENT_RESET))
       return VK_ERROR_DEVICE_LOST;
 
    return VK_SUCCESS;
