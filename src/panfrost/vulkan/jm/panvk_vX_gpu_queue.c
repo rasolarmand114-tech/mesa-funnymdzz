@@ -9,32 +9,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-/* NOTE (rewrite): this file used to talk to the kbase Job Manager device
- * directly (raw ioctl(KBASE_IOCTL_JOB_SUBMIT), a hand-rolled poll()+read()
- * loop over base_jd_event_v2, and the base_jd_* uAPI enums straight out of
- * panvk_kbase_uapi.h). It now goes exclusively through the kbase_jm.h
- * add-on to the kbase kmod backend, which owns the fd, the atom-number
- * bookkeeping and the job-slot ↔ core_req mapping instead.
- *
- * This requires two small additions elsewhere that aren't in this file:
- *
- *   - struct panvk_gpu_queue (panvk_queue.h) needs two new fields,
- *     cached at queue-creation time:
- *
- *        int8_t vt_jobslot;   // job slot for vertex/tiler atoms
- *        int8_t frag_jobslot; // job slot for fragment atoms
- *
- *     (jm_last_atom, already there, is unchanged in meaning: 0 == "no
- *     previous atom on this queue", otherwise the last atom_number we
- *     were assigned.)
- *
- *   - panvk_per_arch(event_update)() in panvk_event.c should take an
- *     `enum kbase_jm_soft_event_status` instead of a raw
- *     BASE_JD_SOFT_EVENT_* value, and forward it to
- *     kbase_jm_soft_event_update() itself. This file now passes the
- *     kbase_jm.h enum values at the call sites below.
- */
-
+#include  "../../lib/kmod/kbase_jm.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <string.h>
@@ -43,8 +18,6 @@
 
 #include "decode.h"
 
-#include "../../lib/kmod/kbase_jm.h"
-
 #include "panvk_cmd_buffer.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
@@ -52,6 +25,7 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
+#include "panvk_kbase_jm.h"
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
@@ -59,24 +33,53 @@
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
-static inline struct pan_kmod_dev *
-panvk_queue_kmod_dev(struct panvk_gpu_queue *queue)
-{
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(dev->vk.physical);
+/*
+ * NOTE ON THE PORT TO kbase_jm.h
+ * ===============================
+ * This file used to talk to the kbase JM ioctl ABI directly (raw fd,
+ * struct base_jd_atom_v2, poll()+read() on base_jd_event_v2, ...). It now
+ * goes through the kbase_jm.h add-on to the kmod backend instead. A few
+ * points where kbase_jm.h doesn't fully pin down the contract are called
+ * out below with the assumption this port makes -- flag these if the
+ * real header disagrees:
+ *
+ *  - kbase_jm_atom_submit() has no explicit "atom_number" out-param, but
+ *    something has to identify *which* atom a later kbase_jm_wait_event()
+ *    completion belongs to. This port assumes the non-negative return
+ *    value on success *is* the assigned atom_number (1..255, kbase's
+ *    BASE_JD_ATOM_COUNT space), and a negative return is -errno.
+ *
+ *  - struct kbase_jm_atom_desc::depends_on_atom uses the same "0 means no
+ *    dependency" convention as the raw pre_dep[0] chaining this replaces
+ *    (kbase_jm.h reserves atom_number 0 as a sentinel too, mirroring the
+ *    kernel ABI it wraps).
+ *
+ *  - KBASE_JM_SOFT_EVENT_SET/RESET are assumed to be value-compatible
+ *    drop-ins for the raw BASE_JD_SOFT_EVENT_SET/RESET that used to be
+ *    passed into panvk_per_arch(event_update)().
+ *
+ *  - kbase_jm_post_term() isn't exercised anywhere else in this file's
+ *    original logic, so it's called from destroy_gpu_queue() as the
+ *    natural per-queue JM teardown hook. Move it if there's a better home.
+ *
+ * Also: struct panvk_gpu_queue (panvk_queue.h) needs two new fields this
+ * port relies on, since job-slot routing is now resolved once at queue
+ * creation instead of being baked into core_req flags per submission:
+ *
+ *   struct panvk_gpu_queue {
+ *      ...
+ *      uint8_t jm_last_atom;   // already existed
+ *      int     jm_vt_slot;     // NEW: job slot index for vertex+tiler atoms
+ *      int     jm_frag_slot;   // NEW: job slot index for fragment atoms
+ *   };
+ */
 
-   return phys_dev->kmod.dev;
-}
-
-/* Picks the first job slot whose JSn_FEATURES advertise every bit in
- * want_mask, or -1 if none do. Mirrors what kbase_js_choose_affinity() /
- * kbasep_js_... in mali_kbase_js.c of the kernel would route the
- * equivalent core_req to, except we do it once at queue-creation time
- * instead of leaving it to the kernel on every submission. */
+/* Pick the first job slot whose advertised JS_FEATURES cover every bit in
+ * want_mask. Mirrors what kbase_js_choose_affinity()/mali_kbase_js.c does
+ * kernel-side, just done once up front instead of per submission. */
 static int
-panvk_kbase_jm_pick_slot(const struct kbase_jm_job_slot_info *slots,
-                         uint32_t want_mask)
+panvk_kbase_pick_job_slot(const struct kbase_jm_job_slot_info *slots,
+                           uint32_t want_mask)
 {
    for (uint32_t i = 0; i < slots->slot_count; i++) {
       if ((slots->features[i] & want_mask) == want_mask)
@@ -93,70 +96,67 @@ panvk_kbase_jm_pick_slot(const struct kbase_jm_job_slot_info *slots,
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: a kbase atom's
  * dependency can only reference one prior atom_number *on this same
- * context*, and completion is only observable by draining the shared
- * completion-event stream kbase_jm_wait_event() reads from -- there's
- * nothing DRM-syncobj-shaped to export or wait on from outside this
- * function.
+ * context*, and completion is only observable by draining the shared JM
+ * event stream for the device -- there's nothing DRM-syncobj-shaped to
+ * export or wait on from outside this function.
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
-                          enum kbase_jm_atom_kind kind, uint64_t jc)
+                           enum kbase_jm_atom_kind kind, uint64_t jc)
 {
-   struct pan_kmod_dev *kdev = panvk_queue_kmod_dev(queue);
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct pan_kmod_dev *kdev = dev->kmod.dev;
+
+   int jobslot = kind == KBASE_JM_ATOM_FRAGMENT ? queue->jm_frag_slot
+                                                 : queue->jm_vt_slot;
 
    struct kbase_jm_atom_desc desc = {
       .jc = jc,
       .kind = kind,
       .priority = KBASE_JM_PRIO_MEDIUM,
-      .jobslot = kind == KBASE_JM_ATOM_FRAGMENT ? queue->frag_jobslot
-                                                : queue->vt_jobslot,
+      .jobslot = jobslot,
+      /* 0 means "no dependency" -- see the port notes above. On this
+       * queue only one atom is ever outstanding, so there's no risk of
+       * this depending on an atom that already got reused/recycled
+       * kbase-side. */
       .depends_on_atom = queue->jm_last_atom,
    };
 
-   /* kbase_jm_atom_submit() returns the freshly assigned atom_number
-    * (>= 0) on success, or a negative errno value on failure. Atom
-    * number 0 is reserved by the uAPI to mean "no dependency" in
-    * depends_on_atom, so the kbase_jm layer never hands out 0 for a real
-    * submission. */
-   int atom_number = kbase_jm_atom_submit(kdev, &desc);
-   if (atom_number < 0) {
-      mesa_loge("panvk: kbase_jm_atom_submit failed: %s",
-               strerror(-atom_number));
+   int ret = kbase_jm_atom_submit(kdev, &desc);
+   if (ret < 0) {
+      mesa_loge("panvk: kbase_jm_atom_submit failed: %s", strerror(-ret));
       return false;
    }
 
-   queue->jm_last_atom = (uint8_t)atom_number;
+   uint8_t atom_number = (uint8_t)ret;
+   queue->jm_last_atom = atom_number;
 
    /* Only one atom is ever in flight at a time in this submission model,
-    * so the next event for *this atom_number* is the one we're waiting
-    * for; anything else read off the stream first (there shouldn't be
+    * so the next completion for *this atom_number* is the one we're
+    * waiting for; anything else reported first (there shouldn't be
     * anything else, but the ABI doesn't promise it) is skipped. */
    for (;;) {
       uint8_t evt_atom_number;
-      bool evt_succeeded;
+      bool succeeded;
 
-      /* Negative timeout blocks forever, per kbase_jm_wait_event()'s
-       * documented contract. */
-      int ret = kbase_jm_wait_event(kdev, -1, &evt_atom_number,
-                                    &evt_succeeded);
-      if (ret < 0) {
+      int wret = kbase_jm_wait_event(kdev, -1, &evt_atom_number, &succeeded);
+      if (wret < 0) {
          mesa_loge("panvk: kbase_jm_wait_event failed: %s", strerror(errno));
          return false;
       }
 
-      /* We waited forever, so a 0 return (timeout) can't actually
-       * happen, but handle it defensively rather than spinning on
-       * undefined behaviour if that contract ever changes. */
-      if (ret == 0)
+      /* timeout_ns == -1 means "block forever", so a 0 return (timeout)
+       * shouldn't happen; treat it as a spurious wakeup rather than fail. */
+      if (wret == 0)
          continue;
 
-      if (evt_atom_number != (uint8_t)atom_number)
+      if (evt_atom_number != atom_number)
          continue;
 
-      if (!evt_succeeded) {
+      if (!succeeded) {
          mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
-                  ") reported failure",
-                  atom_number, jc);
+                   ") reported failure",
+                   atom_number, jc);
          return false;
       }
 
@@ -371,10 +371,6 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
                                  uint32_t queue_idx,
                                  struct vk_queue **out_queue)
 {
-   struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(device->vk.physical);
-   struct pan_kmod_dev *kdev = phys_dev->kmod.dev;
-
    ASSERTED const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(create_info->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
@@ -383,35 +379,12 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
    /* XXX: struct kbase_jm_atom_desc only carries a per-atom
-    * enum kbase_jm_atom_priority value, not a queue-wide priority
-    * negotiated at creation time, so we don't plumb anything beyond
-    * MEDIUM through yet. */
+    * kbase_jm_atom_priority value, not a queue-wide priority negotiated
+    * at creation time, so we don't plumb anything beyond MEDIUM through
+    * yet. */
    assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
 
-   /* This submission path only knows how to drive a kbase Job Manager
-    * device via kbase_jm.h; CSF devices use an entirely different
-    * command-stream-ring submission model that lives elsewhere. */
-   assert(kbase_gfx_dev_kind(kdev) == KBASE_GFX_DEV_JM);
-
-   struct kbase_jm_job_slot_info slots;
-   if (kbase_jm_query_job_slots(kdev, &slots)) {
-      return panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
-                          "kbase_jm_query_job_slots failed: %s",
-                          strerror(errno));
-   }
-
-   int vt_jobslot = panvk_kbase_jm_pick_slot(
-      &slots, KBASE_JM_JSn_FEATURE_VERTEX | KBASE_JM_JSn_FEATURE_TILER);
-   int frag_jobslot =
-      panvk_kbase_jm_pick_slot(&slots, KBASE_JM_JSn_FEATURE_FRAGMENT);
-
-   if (vt_jobslot < 0 || frag_jobslot < 0) {
-      return panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
-                          "no kbase JM job slot advertises the "
-                          "vertex+tiler or fragment feature bits we need "
-                          "(vt=%d, frag=%d)",
-                          vt_jobslot, frag_jobslot);
-   }
+   assert(kbase_gfx_dev_kind(device->kmod.dev) == KBASE_GFX_DEV_JM);
 
    struct panvk_gpu_queue *queue =
       vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
@@ -424,15 +397,37 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   /* See the note at the top of this file: these two fields need to be
-    * added to struct panvk_gpu_queue in panvk_queue.h. */
-   queue->vt_jobslot = (int8_t)vt_jobslot;
-   queue->frag_jobslot = (int8_t)frag_jobslot;
+   /* Job-slot routing (which queue slot vertex/tiler vs fragment atoms
+    * land on) used to be implicit in the core_req flags handed to every
+    * ioctl. kbase_jm.h asks for an explicit slot index per atom instead,
+    * so resolve it once here against this device's JS_FEATURES. */
+   struct kbase_jm_job_slot_info slots;
+   int ret = kbase_jm_query_job_slots(device->kmod.dev, &slots);
+   if (ret) {
+      result = panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
+                            "failed to query kbase JM job slots: %s",
+                            strerror(-ret));
+      goto err_finish_queue;
+   }
+
+   queue->jm_vt_slot = panvk_kbase_pick_job_slot(
+      &slots, KBASE_JM_JSn_FEATURE_VERTEX | KBASE_JM_JSn_FEATURE_TILER);
+   queue->jm_frag_slot =
+      panvk_kbase_pick_job_slot(&slots, KBASE_JM_JSn_FEATURE_FRAGMENT);
+
+   if (queue->jm_vt_slot < 0 || queue->jm_frag_slot < 0) {
+      result = panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
+                            "no kbase JM job slot advertises the required "
+                            "vertex+tiler/fragment JS_FEATURES");
+      goto err_finish_queue;
+   }
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
    return VK_SUCCESS;
 
+err_finish_queue:
+   vk_queue_finish(&queue->vk);
 err_free_queue:
    vk_free(&device->vk.alloc, queue);
    return result;
@@ -445,13 +440,9 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
       container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
-   /* Tell the kernel this context is done submitting JM atoms so it can
-    * release whatever it was holding open in anticipation of future
-    * submissions, before we tear the queue itself down. Best-effort: a
-    * failure here doesn't leave anything for us to clean up on our
-    * side, so it's only worth a log line. */
-   if (kbase_jm_post_term(panvk_queue_kmod_dev(queue)))
-      mesa_logw("panvk: kbase_jm_post_term failed: %s", strerror(errno));
+   /* Best-effort JM-side teardown for this queue's context; see the port
+    * notes at the top of the file. */
+   kbase_jm_post_term(dev->kmod.dev);
 
    vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
