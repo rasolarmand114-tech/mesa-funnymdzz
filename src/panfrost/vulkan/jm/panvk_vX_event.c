@@ -3,11 +3,57 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
+#include <string.h>
+
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_event.h"
+#include "panvk_priv_bo.h"
+
+#include "util/log.h"
 
 #include "vk_log.h"
+
+#include "kbase_jm.h"
+
+/* The soft-event ioctl only ever touches a single status byte, but we give
+ * it a whole tiny BO of its own (rather than suballocating out of some
+ * shared pool) so panvk_priv_bo_flush()/_invalidate() on it can't stomp on,
+ * or be stomped on by, unrelated data sharing the same cacheline. */
+#define PANVK_EVENT_BO_SIZE 64
+
+static inline volatile uint8_t *
+panvk_event_status_ptr(const struct panvk_event *event)
+{
+   return (volatile uint8_t *)event->bo->addr.host;
+}
+
+bool
+panvk_per_arch(event_is_set)(const struct panvk_event *event)
+{
+   /* The byte we're reading was last written by the kernel (in response to
+    * kbase_jm_soft_event_update()), not by us, so make sure we're not
+    * looking at a stale CPU-cached copy of it. */
+   panvk_priv_bo_invalidate(event->bo, 0, PANVK_EVENT_BO_SIZE);
+
+   return *panvk_event_status_ptr(event) == (uint8_t)KBASE_JM_SOFT_EVENT_SET;
+}
+
+bool
+panvk_per_arch(event_update)(struct panvk_device *dev,
+                             struct panvk_event *event,
+                             enum kbase_jm_soft_event_status status)
+{
+   if (kbase_jm_soft_event_update(dev->kmod.dev, event->bo->addr.dev,
+                                  status)) {
+      mesa_loge("panvk: kbase_jm_soft_event_update() failed: %s",
+                strerror(errno));
+      return false;
+   }
+
+   return true;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(CreateEvent)(VkDevice _device,
@@ -21,16 +67,23 @@ panvk_per_arch(CreateEvent)(VkDevice _device,
    if (!event)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   struct drm_syncobj_create create = {
-      .flags = 0,
-   };
+   VkResult result =
+      panvk_priv_bo_create(device, PANVK_EVENT_BO_SIZE, 0,
+                           VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &event->bo);
+   if (result != VK_SUCCESS) {
+      vk_object_free(&device->vk, pAllocator, event);
+      return result;
+   }
 
-   int ret = pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_CREATE,
-                            &create);
-   if (ret)
+   /* Start out RESET, same initial state a freshly created (non-SIGNALED)
+    * DRM syncobj used to have. */
+   if (!panvk_per_arch(event_update)(device, event,
+                                     KBASE_JM_SOFT_EVENT_RESET)) {
+      panvk_priv_bo_unref(event->bo);
+      vk_object_free(&device->vk, pAllocator, event);
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
 
-   event->syncobj = create.handle;
    *pEvent = panvk_event_to_handle(event);
 
    return VK_SUCCESS;
@@ -46,38 +99,16 @@ panvk_per_arch(DestroyEvent)(VkDevice _device, VkEvent _event,
    if (!event)
       return;
 
-   struct drm_syncobj_destroy destroy = {.handle = event->syncobj};
-   pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy);
-
+   panvk_priv_bo_unref(event->bo);
    vk_object_free(&device->vk, pAllocator, event);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_per_arch(GetEventStatus)(VkDevice _device, VkEvent _event)
 {
-   VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
-   bool signaled;
 
-   struct drm_syncobj_wait wait = {
-      .handles = (uintptr_t)&event->syncobj,
-      .count_handles = 1,
-      .timeout_nsec = 0,
-      .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-   };
-
-   int ret = pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait);
-   if (ret) {
-      if (errno == ETIME)
-         signaled = false;
-      else {
-         assert(0);
-         return VK_ERROR_DEVICE_LOST; /* TODO */
-      }
-   } else
-      signaled = true;
-
-   return signaled ? VK_EVENT_SET : VK_EVENT_RESET;
+   return panvk_per_arch(event_is_set)(event) ? VK_EVENT_SET : VK_EVENT_RESET;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -86,17 +117,7 @@ panvk_per_arch(SetEvent)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   struct drm_syncobj_array objs = {
-      .handles = (uint64_t)(uintptr_t)&event->syncobj,
-      .count_handles = 1};
-
-   /* This is going to just replace the fence for this syncobj with one that
-    * is already in signaled state. This won't be a problem because the spec
-    * mandates that the event will have been set before the vkCmdWaitEvents
-    * command executes.
-    * https://docs.vulkan.org/spec/latest/chapters/cmdbuffers.html#commandbuffers-submission-progress
-    */
-   if (pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_SIGNAL, &objs))
+   if (!panvk_per_arch(event_update)(device, event, KBASE_JM_SOFT_EVENT_SET))
       return VK_ERROR_DEVICE_LOST;
 
    return VK_SUCCESS;
@@ -108,11 +129,8 @@ panvk_per_arch(ResetEvent)(VkDevice _device, VkEvent _event)
    VK_FROM_HANDLE(panvk_device, device, _device);
    VK_FROM_HANDLE(panvk_event, event, _event);
 
-   struct drm_syncobj_array objs = {
-      .handles = (uint64_t)(uintptr_t)&event->syncobj,
-      .count_handles = 1};
-
-   if (pan_kmod_ioctl(device->drm_fd, DRM_IOCTL_SYNCOBJ_RESET, &objs))
+   if (!panvk_per_arch(event_update)(device, event,
+                                     KBASE_JM_SOFT_EVENT_RESET))
       return VK_ERROR_DEVICE_LOST;
 
    return VK_SUCCESS;
