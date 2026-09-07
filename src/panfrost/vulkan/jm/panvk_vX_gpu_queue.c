@@ -9,6 +9,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
+#include <inttypes.h>
+#include <poll.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 #include "genxml/gen_macros.h"
 
 #include "decode.h"
@@ -20,6 +27,8 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
+#include "panvk_kbase_fd.h"
+#include "panvk_kbase_uapi.h"
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
@@ -27,63 +36,112 @@
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
-#include "../../lib/kmod/kbase_jm.h"
+/* Which JM job slot a kbase atom lands on is picked from its core_req
+ * flags, not passed explicitly: no flags (0) goes to slot 0, which is what
+ * Panfrost-style combined vertex+tiler job chains want; BASE_JD_REQ_FS
+ * marks a fragment-only job chain and routes it to slot 2. See
+ * kbase_js_choose_affinity()/kbasep_js_...  in mali_kbase_js.c of the
+ * linked kernel tree for the actual slot-selection logic this is
+ * mirroring.
+ */
+enum panvk_kbase_atom_kind {
+   PANVK_KBASE_ATOM_VERTEX_TILER,
+   PANVK_KBASE_ATOM_FRAGMENT,
+};
 
 /* Submit a single job chain as one kbase JM atom, chained onto the atom
  * this queue submitted last, and block until it (and therefore everything
  * submitted before it on this queue) has completed.
  *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
- * synchronous instead of returning a fence-like object: kbase_jm_atom_desc
- * only lets an atom depend on one prior atom on the *same* context, and
- * completion is only observable by draining a shared poll()+read() event
- * stream on the device fd -- there's nothing DRM-syncobj-shaped to export
- * or wait on from outside this function.
+ * synchronous instead of returning a fence-like object: a kbase atom's
+ * pre_dep can only reference one prior atom_number *on this same
+ * context*, and completion is only observable by draining a shared
+ * poll()+read() base_jd_event_v2 stream on the device fd -- there's
+ * nothing DRM-syncobj-shaped to export or wait on from outside this
+ * function.
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
-                           enum kbase_jm_atom_kind kind, uint64_t jc)
+                           enum panvk_kbase_atom_kind kind, uint64_t jc)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   int fd = panvk_kbase_raw_fd(dev);
 
-   struct kbase_jm_atom_desc desc = {
+   /* Atom numbers are a u8 (BASE_JD_ATOM_COUNT == 256) and 0 is reserved
+    * to mean "no dependency" in pre_dep, so cycle through 1..255. Since
+    * this queue only ever has one atom in flight, there's no risk of
+    * colliding with an atom that's still outstanding. */
+   uint8_t atom_number = queue->jm_last_atom + 1;
+   if (atom_number == 0)
+      atom_number = 1;
+
+   struct base_jd_atom_v2 atom = {
       .jc = jc,
-      .kind = kind,
-      .priority = KBASE_JM_PRIO_MEDIUM,
-      .jobslot = -1, /* let kbase_jm pick a slot advertising the JSn
-                       * features this atom kind needs */
-      .depends_on_atom = queue->jm_last_atom,
+      .core_req = kind == PANVK_KBASE_ATOM_FRAGMENT ? BASE_JD_REQ_FS : 0,
+      .atom_number = atom_number,
+      .prio = BASE_JD_PRIO_MEDIUM,
    };
 
-   int atom_id = kbase_jm_atom_submit(dev->kmod.dev, &desc);
-   if (atom_id < 0) {
-      mesa_loge("panvk: kbase_jm_atom_submit() failed: %s", strerror(errno));
+   if (queue->jm_last_atom != 0) {
+      atom.pre_dep[0].atom_id = queue->jm_last_atom;
+      atom.pre_dep[0].dependency_type = BASE_JD_DEP_TYPE_DATA;
+   }
+
+   struct kbase_ioctl_job_submit submit = {
+      .addr = (uintptr_t)&atom,
+      .nr_atoms = 1,
+      .stride = sizeof(atom),
+   };
+
+   /* Unlike DRM_IOCTL_PANFROST_SUBMIT, kbase JM atoms don't take an
+    * explicit BO handle list: all BOs live in the single VM bound to this
+    * kbase context already, so there's nothing to pass here beyond the
+    * job chain pointer itself (hence extres_list/nr_extres staying 0). */
+   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit)) {
+      mesa_loge("panvk: KBASE_IOCTL_JOB_SUBMIT failed: %s", strerror(errno));
       return false;
    }
 
-   queue->jm_last_atom = (uint8_t)atom_id;
+   queue->jm_last_atom = atom_number;
 
-   /* Only one atom is ever in flight at a time in this submission model, so
-    * the next JM event this queue observes has to be the one for the atom
-    * we just submitted. */
-   uint8_t completed_atom;
-   bool succeeded;
-   int ret = kbase_jm_wait_event(dev->kmod.dev, -1, &completed_atom,
-                                 &succeeded);
-   if (ret < 0) {
-      mesa_loge("panvk: kbase_jm_wait_event() failed: %s", strerror(errno));
-      return false;
+   /* Only one atom is ever in flight at a time in this submission model,
+    * so the next event for *this atom_number* is the one we're waiting
+    * for; anything else read off the stream first (there shouldn't be
+    * anything else, but the ABI doesn't promise it) is skipped. */
+   for (;;) {
+      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+      int pret = poll(&pfd, 1, -1);
+      if (pret < 0) {
+         if (errno == EINTR)
+            continue;
+         mesa_loge("panvk: poll() on kbase fd failed: %s", strerror(errno));
+         return false;
+      }
+
+      struct base_jd_event_v2 evt;
+      ssize_t n = read(fd, &evt, sizeof(evt));
+      if (n < 0) {
+         if (errno == EINTR || errno == EAGAIN)
+            continue;
+         mesa_loge("panvk: read() on kbase fd failed: %s", strerror(errno));
+         return false;
+      }
+      if (n == 0 || (size_t)n < sizeof(evt))
+         continue;
+
+      if (evt.atom_number != atom_number)
+         continue;
+
+      if (evt.event_code != BASE_JD_EVENT_DONE) {
+         mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
+                   ") reported failure (event_code 0x%x)",
+                   atom_number, jc, evt.event_code);
+         return false;
+      }
+
+      return true;
    }
-
-   assert(completed_atom == (uint8_t)atom_id);
-
-   if (!succeeded) {
-      mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
-                ") reported failure", completed_atom, jc);
-      return false;
-   }
-
-   return true;
 }
 
 static bool
@@ -120,12 +178,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
     * make sure things are GPU-visible. */
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
-   /* Unlike DRM_IOCTL_PANFROST_SUBMIT, kbase JM atoms don't take an
-    * explicit BO handle list: all BOs live in the single VM bound to this
-    * kbase context already, so there's nothing to pass here beyond the job
-    * chain pointer itself. */
    if (batch->vtc_jc.first_job) {
-      if (!panvk_queue_jm_submit_atom(queue, KBASE_JM_ATOM_VERTEX_TILER,
+      if (!panvk_queue_jm_submit_atom(queue, PANVK_KBASE_ATOM_VERTEX_TILER,
                                       batch->vtc_jc.first_job))
          return false;
 
@@ -152,7 +206,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
-      if (!panvk_queue_jm_submit_atom(queue, KBASE_JM_ATOM_FRAGMENT,
+      if (!panvk_queue_jm_submit_atom(queue, PANVK_KBASE_ATOM_FRAGMENT,
                                       batch->frag_jc.first_job))
          return false;
 
@@ -182,7 +236,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 }
 
 /* vkCmdWaitEvents2() operations recorded on this batch. There's no GPU-side
- * soft-event-wait atom exposed by kbase_jm.h, so -- same spirit as the
+ * soft-event-wait atom we submit here, so -- same spirit as the
  * synchronous atom submission above -- we just block the CPU on the
  * host-visible event status until it's set. Because this queue only ever
  * has one batch in flight at a time, nothing downstream can race ahead of
@@ -218,12 +272,12 @@ panvk_queue_signal_events(struct panvk_gpu_queue *queue,
       switch (op->type) {
       case PANVK_EVENT_OP_SET:
          if (!panvk_per_arch(event_update)(dev, op->event,
-                                           KBASE_JM_SOFT_EVENT_SET))
+                                           BASE_JD_SOFT_EVENT_SET))
             return VK_ERROR_DEVICE_LOST;
          break;
       case PANVK_EVENT_OP_RESET:
          if (!panvk_per_arch(event_update)(dev, op->event,
-                                           KBASE_JM_SOFT_EVENT_RESET))
+                                           BASE_JD_SOFT_EVENT_RESET))
             return VK_ERROR_DEVICE_LOST;
          break;
       case PANVK_EVENT_OP_WAIT:
@@ -246,8 +300,8 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    VkResult result;
 
-   /* kbase_jm_atom_desc can only chain an atom onto one prior atom *on this
-    * same queue*; there's no way to hand it an external semaphore as a
+   /* A kbase atom's pre_dep can only chain onto prior atoms *on this same
+    * queue*; there's no way to hand it an external semaphore as a
     * GPU-side dependency. So wait semaphores are resolved on the CPU,
     * before we submit anything. This queue's own submissions are already
     * fully synchronous (see panvk_queue_jm_submit_atom()), so this doesn't
@@ -304,12 +358,10 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* XXX: kbase_jm_atom_desc only carries a per-atom BASE_JD_PRIO_* value
-    * (see kbase_jm_base_prio()), not a queue-wide priority negotiated at
-    * creation time, so we don't plumb anything beyond MEDIUM through yet. */
+   /* XXX: struct base_jd_atom_v2 only carries a per-atom BASE_JD_PRIO_*
+    * value, not a queue-wide priority negotiated at creation time, so we
+    * don't plumb anything beyond MEDIUM through yet. */
    assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
-
-   assert(kbase_gfx_dev_kind(device->kmod.dev) == KBASE_GFX_DEV_JM);
 
    struct panvk_gpu_queue *queue =
       vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
