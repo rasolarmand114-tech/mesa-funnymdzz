@@ -15,7 +15,7 @@
 
 #include "vk_log.h"
 
-#include "kbase_jm.h"
+#include "../../lib/kmod/kbase_jm.h"
 
 /* The soft-event ioctl only ever touches a single status byte, but we give
  * it a whole tiny BO of its own (rather than suballocating out of some
