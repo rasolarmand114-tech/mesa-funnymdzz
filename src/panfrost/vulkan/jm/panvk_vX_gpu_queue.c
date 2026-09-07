@@ -27,7 +27,7 @@
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
-#include "kbase_jm.h"
+#include "../../lib/kmod/kbase_jm.h"
 
 /* Submit a single job chain as one kbase JM atom, chained onto the atom
  * this queue submitted last, and block until it (and therefore everything
