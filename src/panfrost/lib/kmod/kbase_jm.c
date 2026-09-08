@@ -189,7 +189,13 @@ kbase_jm_core_req_for_kind(enum kbase_jm_atom_kind kind)
 {
    switch (kind) {
    case KBASE_JM_ATOM_VERTEX_TILER:
-      return BASE_JD_REQ_FS | BASE_JD_REQ_T;
+      /* BASE_JD_REQ_CS ("requires compute shaders") also covers Vertex
+       * and Geometry Shader jobs -- see mali_base_jm_kernel.h. Using
+       * BASE_JD_REQ_FS here (fragment shaders) tags the atom as the
+       * wrong HW job type and makes the kernel scheduler reject/misroute
+       * it, which is why every non-trivial vkQueueSubmit() used to fail
+       * on its very first vertex+tiler atom. */
+      return BASE_JD_REQ_CS | BASE_JD_REQ_T;
    case KBASE_JM_ATOM_FRAGMENT:
       return BASE_JD_REQ_FS;
    case KBASE_JM_ATOM_COMPUTE:
