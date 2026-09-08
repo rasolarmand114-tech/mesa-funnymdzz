@@ -32,7 +32,7 @@
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
-#include "drm-uapi/mali_kbase_ioctl.h"
+#include "../../lib/kmod/mali_kbase_ioctl.h"
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
