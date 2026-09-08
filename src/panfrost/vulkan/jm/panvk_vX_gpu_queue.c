@@ -123,7 +123,11 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
 
    int ret = kbase_jm_atom_submit(kdev, &desc);
    if (ret < 0) {
-      mesa_loge("panvk: kbase_jm_atom_submit failed: %s", strerror(-ret));
+      /* kbase_jm_atom_submit() returns plain -1 on failure and sets
+       * errno (it already logs its own mesa_loge() with the real
+       * reason) -- it does not return -errno, so errno is what we
+       * report here, not -ret. */
+      mesa_loge("panvk: kbase_jm_atom_submit failed: %s", strerror(errno));
       return false;
    }
 
@@ -403,9 +407,11 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    struct kbase_jm_job_slot_info slots;
    int ret = kbase_jm_query_job_slots(device->kmod.dev, &slots);
    if (ret) {
+      /* Plain -1 + errno on failure, same convention as
+       * kbase_jm_atom_submit() -- see the note there. */
       result = panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
                             "failed to query kbase JM job slots: %s",
-                            strerror(-ret));
+                            strerror(errno));
       goto err_finish_queue;
    }
 
