@@ -32,128 +32,63 @@
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
-#include "../../lib/kmod/mali_kbase_ioctl.h"
+
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
 /*
- * NOTE ON THE PORT AWAY FROM kbase_jm.h, BACK TO RAW IOCTLS
- * ===========================================================
- * This file used to go through the kbase_jm.h add-on to the kmod backend
- * (kbase_jm_atom_submit(), kbase_jm_wait_event(), kbase_jm_query_job_slots(),
- * kbase_jm_soft_event_update(), kbase_jm_post_term()). It now talks to
- * /dev/mali* directly with the ioctls in mali_kbase_ioctl.h (the JM flavour:
- * VERSION_CHECK is ioctl nr 0), the same header this tree vendors as
- * panvk_kbase_uapi.h.
+ * NOTE ON THIS PORT (JM-only, raw kbase ioctl UAPI)
+ * ===================================================
+ * This talks to /dev/mali* directly through the vendored kbase uapi
+ * headers: mali_kbase_ioctl.h, mali_kbase_jm_ioctl.h, mali_base_kernel.h and
+ * mali_base_jm_kernel.h (pulled in transitively via panvk_kbase_uapi.h /
+ * mali_base_kernel.h's own #include of mali_base_jm_kernel.h). No
+ * kbase_jm.h wrapper is used anywhere in this file. Every ioctl number,
+ * struct layout, and flag/enum value referenced below -- struct
+ * kbase_ioctl_job_submit, struct base_jd_atom_v2, struct base_dependency,
+ * struct base_jd_udata, base_jd_core_req (BASE_JD_REQ_*), base_jd_prio
+ * (BASE_JD_PRIO_*), base_jd_dep_type (BASE_JD_DEP_TYPE_*), struct
+ * base_jd_event_v2, base_jd_event_code (BASE_JD_EVENT_*),
+ * KBASE_IOCTL_GET_GPUPROPS + its KBASE_GPUPROP_* keys, and
+ * KBASE_IOCTL_POST_TERM -- comes verbatim from those four headers.
  *
- * mali_kbase_ioctl.h pins down KBASE_IOCTL_JOB_SUBMIT's *outer* shape
- * (struct kbase_ioctl_job_submit: a userspace pointer + count + stride) and
- * KBASE_IOCTL_GET_GPUPROPS's serialised property blob, but it deliberately
- * does not define the per-atom payload that .addr points to (that lives in
- * mali_kbase_jm_ioctl.h upstream, which wasn't part of the header handed to
- * this port) or the struct read() back from the device fd on completion.
- * Those two layouts -- struct base_jd_atom_v2 and struct base_jd_event_v2,
- * plus the base_jd_core_req / base_jd_event_code enums they embed -- are
- * reconstructed below from the public kbase JM ABI (the same ABI the
- * kbase_jm.h wrapper itself sits on top of) and marked
- * PANVK_KBASE_JM_ATOM_ABI_UNVERIFIED. Exactly like the disclaimer already in
- * panvk_kbase_uapi.h: a hand-reconstructed ioctl payload struct is a real
- * ABI-mismatch risk (wrong field order/size here means kernel memory
- * corruption, not a compile error), so before this lands anywhere real,
- * replace the block below with a verbatim copy of mali_kbase_jm_ioctl.h /
- * mali_base_kernel.h from the exact kernel commit being targeted, the same
- * way mali_kbase_ioctl.h itself was vendored.
+ * One thing is genuinely a userspace policy choice, not something read out
+ * of the uapi headers, and is called out where it happens below:
  *
- * Assumptions this port makes that aren't nailed down by the header we do
- * have:
+ *  - struct base_jd_atom_v2::atom_number is picked by *us*, not assigned by
+ *    the kernel -- its doc comment just says "Unique number to identify the
+ *    atom", and kbase userspace clients own that numbering (out of the
+ *    BASE_JD_ATOM_COUNT-sized space, 0..255, defined in
+ *    mali_base_jm_kernel.h). Since this queue only ever has one atom
+ *    in flight, a simple counter cycling through 1..255 (skipping 0, which
+ *    doubles as the "no dependency" sentinel value for pre_dep) is enough
+ *    to guarantee uniqueness against anything still outstanding.
  *
- *  - struct panvk_gpu_queue (panvk_queue.h) keeps jm_last_atom, jm_vt_slot
- *    and jm_frag_slot exactly as before; only how they're produced and
- *    consumed changes.
+ *  - Which BASE_JD_REQ_* bits to set for the vertex+tiler vs fragment job
+ *    chains is likewise a driver policy call, made directly from the
+ *    documented meaning of each flag in mali_base_jm_kernel.h (BASE_JD_REQ_
+ *    CS covers "Vertex Shader Job, Geometry Shader Job, ... Compute Shader
+ *    Job"; BASE_JD_REQ_T is "Requires tiling"; BASE_JD_REQ_FS is "Requires
+ *    fragment shaders"), not a struct layout that could be gotten wrong at
+ *    the ABI level.
  *
- *  - "0 means no dependency" for base_jd_dependency::atom_id, matching the
- *    kbase_jm.h wrapper's convention that this port replaces, and matching
- *    kbase's own reservation of atom_number 0 as a sentinel.
- *
- *  - The device fd (dev->kmod.dev->fd) has already been through the
- *    VERSION_CHECK_JM + SET_FLAGS handshake by the time a queue is created;
- *    that handshake is device-level setup and isn't repeated here.
- *
- *  - Soft-event set/reset for vkEvent support (panvk_per_arch(event_update)()
- *    / panvk_per_arch(event_is_set)(), implemented in panvk_vX_event.c) is
- *    left untouched -- out of scope for this file.
- *
- *  - kbase's read() on the device fd is blocking and yields whole
- *    struct base_jd_event_v2 records; poll()+read() one at a time is
- *    sufficient since this queue only ever has one atom in flight.
+ * Also note: KBASE_IOCTL_SOFT_EVENT_UPDATE (ioctl nr 28, in
+ * mali_kbase_jm_ioctl.h) is a direct ioctl, not a soft-job atom, so vkEvent
+ * set/reset (panvk_per_arch(event_update)()/event_is_set)(), implemented in
+ * panvk_vX_event.c) doesn't touch base_jd_atom_v2 at all; that file is out
+ * of scope here and is left calling into those functions as before.
  */
-#define PANVK_KBASE_JM_ATOM_ABI_UNVERIFIED 1
 
-/* --- base_jd_core_req (job requirement flags), JM job-slot routing bits.
- * Public kbase ABI; see the disclaimer above. */
-typedef __u32 base_jd_core_req;
+/* -----------------------------------------------------------------------
+ * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS.
+ * ----------------------------------------------------------------------- */
 
-#define BASE_JD_REQ_FS       ((base_jd_core_req)1 << 0) /* fragment */
-#define BASE_JD_REQ_CS       ((base_jd_core_req)1 << 1) /* compute */
-#define BASE_JD_REQ_T        ((base_jd_core_req)1 << 2) /* tiler */
-#define BASE_JD_REQ_CF       ((base_jd_core_req)1 << 3) /* cache flush only */
-#define BASE_JD_REQ_V        ((base_jd_core_req)1 << 4) /* vertex/geometry */
-#define BASE_JD_REQ_SOFT_JOB ((base_jd_core_req)1 << 9)
-
-#define BASE_JD_REQ_SOFT_EVENT_WAIT  (BASE_JD_REQ_SOFT_JOB | 0x2u)
-#define BASE_JD_REQ_SOFT_EVENT_SET   (BASE_JD_REQ_SOFT_JOB | 0x3u)
-#define BASE_JD_REQ_SOFT_EVENT_RESET (BASE_JD_REQ_SOFT_JOB | 0x4u)
-
-#define BASE_JD_DEP_TYPE_INVALID 0
-#define BASE_JD_DEP_TYPE_DATA    (1u << 0)
-
-struct base_jd_dependency {
-   __u8 atom_id;
-   __u8 dependency_type;
-};
-
-/* Deprecated even in the real ABI, but still present in the wire struct;
- * left zeroed here. */
-struct base_jd_udata {
-   __u64 blob[2];
-};
-
-/* This is the struct kbase_ioctl_job_submit::addr / ::stride payload:
- * one array element per atom, nr_atoms of them, each stride bytes apart
- * (== sizeof(struct base_jd_atom_v2) when tightly packed, as we do here). */
-struct base_jd_atom_v2 {
-   __u64 jc; /* job chain GPU VA, or soft-job payload VA */
-   struct base_jd_udata udata;
-   __u64 extres_list; /* unused: no external resource list here */
-   __u16 nr_extres;
-   __u16 compat_core_req; /* legacy alias of core_req; kept 0 */
-   struct base_jd_dependency pre_dep[2];
-   __u8 atom_number; /* in: 0 == "assign me one"; out: assigned id */
-   __s8 prio;        /* base_jd_prio; 0 == medium */
-   __u8 device_nr;
-   __u8 jobslot;
-   base_jd_core_req core_req;
-   __u8 padding[4];
-};
-
-#define BASE_JD_PRIO_MEDIUM 0
-
-/* struct read() back from the kbase device fd, one per completed atom. */
-enum base_jd_event_code {
-   BASE_JD_EVENT_DONE = 0,
-   /* Any other value: some flavour of fault/timeout/removed-from-queue.
-    * We don't need to distinguish further than "not DONE" here. */
-};
-
-struct base_jd_event_v2 {
-   __u32 event_code;
-   __u8 atom_number;
-   __u8 padding[3];
-   struct base_jd_udata udata;
-};
-
-/* --- JS_FEATURES bits (per hardware job-slot capability register).
- * Public ARM TRM / kbase GPU-properties ABI; see the disclaimer above. */
+/* JS_FEATURES bits (per hardware job-slot capability register). Not part of
+ * the uapi headers themselves (those only give the *key* used to fetch the
+ * raw register value via GET_GPUPROPS, not the register's own bit layout)
+ * -- these come from the public Mali GPU_JS_FEATURES register
+ * documentation, flagged here since it's the one piece not sourced
+ * directly from the four headers above. */
 #define JS_FEATURE_VERTEX_JOB   (1u << 5)
 #define JS_FEATURE_TILER_JOB    (1u << 7)
 #define JS_FEATURE_FRAGMENT_JOB (1u << 9)
@@ -165,20 +100,18 @@ struct panvk_kbase_js_features {
    uint32_t features[PANVK_KBASE_MAX_JOB_SLOTS];
 };
 
-/* Read the KBASE_IOCTL_GET_GPUPROPS blob (probe-then-fetch, per the ioctl's
- * documented two-call protocol) and pull out RAW_JS_PRESENT plus each
- * present slot's RAW_JS_FEATURES_<n> entry.
- *
- * Blob format, straight from the header: a stream of
+/* Probe-then-fetch per KBASE_IOCTL_GET_GPUPROPS's documented protocol:
+ * call once with size=0 to learn the blob size (returned as the ioctl's
+ * return value), then again with a buffer of that size. Blob format, from
+ * mali_kbase_ioctl.h's own doc comment: a stream of
  *   [u32 LE header = (key << 2) | size_code] [value, size_code bytes]
- * with size_code 0/1/2/3 meaning u8/u16/u32/u64 respectively.
- */
+ * with size_code 00/01/10/11 meaning u8/u16/u32/u64 respectively. */
 static int
 panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
 {
    memset(out, 0, sizeof(*out));
 
-   union kbase_ioctl_get_gpuprops probe = {
+   struct kbase_ioctl_get_gpuprops probe = {
       .buffer = 0,
       .size = 0,
       .flags = 0,
@@ -196,7 +129,7 @@ panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
       return -1;
    }
 
-   union kbase_ioctl_get_gpuprops fetch = {
+   struct kbase_ioctl_get_gpuprops fetch = {
       .buffer = (uintptr_t)blob,
       .size = (uint32_t)blob_size,
       .flags = 0,
@@ -232,10 +165,8 @@ panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
 
       if (key == KBASE_GPUPROP_RAW_JS_PRESENT) {
          out->slot_present_mask = (uint32_t)value;
-      } else if (key == KBASE_GPUPROP_RAW_JS_FEATURES_0) {
-         out->features[0] = (uint32_t)value;
-      } else if (key > KBASE_GPUPROP_RAW_JS_FEATURES_0 &&
-                key <= KBASE_GPUPROP_RAW_JS_FEATURES_0 + 15) {
+      } else if (key >= KBASE_GPUPROP_RAW_JS_FEATURES_0 &&
+                key <= KBASE_GPUPROP_RAW_JS_FEATURES_15) {
          out->features[key - KBASE_GPUPROP_RAW_JS_FEATURES_0] =
             (uint32_t)value;
       }
@@ -263,16 +194,34 @@ panvk_kbase_pick_job_slot(const struct panvk_kbase_js_features *slots,
    return -1;
 }
 
+/* -----------------------------------------------------------------------
+ * Atom submission via KBASE_IOCTL_JOB_SUBMIT, using the real
+ * struct base_jd_atom_v2 from mali_base_jm_kernel.h.
+ * ----------------------------------------------------------------------- */
+
+/* Pick the next atom_number for this queue. base_jd_atom_v2::atom_number is
+ * a userspace-owned value (see the file-level note above), out of the
+ * BASE_JD_ATOM_COUNT (256) space defined in mali_base_jm_kernel.h. Cycles
+ * through 1..255, skipping 0 since a pre_dep referencing atom_id 0 with
+ * BASE_JD_DEP_TYPE_INVALID means "no dependency" -- this queue never has
+ * more than one atom outstanding, so simple cycling can't collide with
+ * anything still in flight. */
+static uint8_t
+panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
+{
+   return (uint8_t)((queue->jm_last_atom % (BASE_JD_ATOM_COUNT - 1)) + 1);
+}
+
 /* Submit a single job chain as one kbase JM atom, chained onto the atom
  * this queue submitted last, and block until it (and therefore everything
  * submitted before it on this queue) has completed.
  *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: a kbase atom's
- * dependency can only reference one prior atom_number *on this same
- * context*, and completion is only observable by draining the shared JM
- * event stream for the device -- there's nothing DRM-syncobj-shaped to
- * export or wait on from outside this function.
+ * dependency can only reference prior atoms *on this same context*, and
+ * completion is only observable by draining the shared JM event stream for
+ * the device -- there's nothing DRM-syncobj-shaped to export or wait on
+ * from outside this function.
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
@@ -282,25 +231,32 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    int fd = dev->kmod.dev->fd;
 
+   uint8_t atom_number = panvk_kbase_next_atom_number(queue);
+
    struct base_jd_atom_v2 atom = {
       .jc = jc,
-      .atom_number = 0, /* let the kernel assign one */
+      .udata = {.blob = {0, 0}},
+      .extres_list = 0,
+      .nr_extres = 0,
+      .jit_id = {0, 0}, /* must be zero, per mali_base_jm_kernel.h */
+      .pre_dep =
+         {
+            {
+               /* jm_last_atom == 0 means "nothing submitted on this queue
+                * yet" -- see the port notes above. */
+               .atom_id = queue->jm_last_atom,
+               .dependency_type = queue->jm_last_atom
+                                     ? BASE_JD_DEP_TYPE_DATA
+                                     : BASE_JD_DEP_TYPE_INVALID,
+            },
+            {.atom_id = 0, .dependency_type = BASE_JD_DEP_TYPE_INVALID},
+         },
+      .atom_number = atom_number,
       .prio = BASE_JD_PRIO_MEDIUM,
       .device_nr = 0,
       .jobslot = (uint8_t)jobslot,
       .core_req = core_req,
-      .pre_dep[0] =
-         {
-            /* 0 means "no dependency" -- see the port notes above. On this
-             * queue only one atom is ever outstanding, so there's no risk
-             * of this depending on an atom that already got
-             * reused/recycled kernel-side. */
-            .atom_id = queue->jm_last_atom,
-            .dependency_type =
-               queue->jm_last_atom ? BASE_JD_DEP_TYPE_DATA
-                                   : BASE_JD_DEP_TYPE_INVALID,
-         },
-      .pre_dep[1] = {.atom_id = 0, .dependency_type = BASE_JD_DEP_TYPE_INVALID},
+      .padding = {0},
    };
 
    struct kbase_ioctl_job_submit submit = {
@@ -315,7 +271,6 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       return false;
    }
 
-   uint8_t atom_number = atom.atom_number;
    queue->jm_last_atom = atom_number;
 
    /* Only one atom is ever in flight at a time in this submission model,
@@ -354,7 +309,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
 
       if (evt.event_code != BASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
-                   ") reported failure (event_code=%u)",
+                   ") reported failure (event_code=0x%x)",
                    atom_number, jc, evt.event_code);
          return false;
       }
@@ -398,9 +353,13 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
-      if (!panvk_queue_jm_submit_atom(
-             queue, BASE_JD_REQ_V | BASE_JD_REQ_T | BASE_JD_REQ_CS,
-             queue->jm_vt_slot, batch->vtc_jc.first_job))
+      /* BASE_JD_REQ_CS covers Vertex/Geometry/Compute Shader jobs;
+       * BASE_JD_REQ_T is tiling -- both per their doc comments in
+       * mali_base_jm_kernel.h. This job chain contains vertex and tiler
+       * jobs. */
+      if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_CS | BASE_JD_REQ_T,
+                                      queue->jm_vt_slot,
+                                      batch->vtc_jc.first_job))
          return false;
 
       /* Submission is always synchronous now, so the work is already done;
@@ -426,6 +385,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
+      /* BASE_JD_REQ_FS: "Requires fragment shaders". */
       if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_FS,
                                       queue->jm_frag_slot,
                                       batch->frag_jc.first_job))
@@ -457,8 +417,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 }
 
 /* vkCmdWaitEvents2() operations recorded on this batch. There's no GPU-side
- * soft-event-wait atom we submit here, so -- same spirit as the
- * synchronous atom submission above -- we just block the CPU on the
+ * soft-event-wait atom we submit here, so we just block the CPU on the
  * host-visible event status until it's set. Because this queue only ever
  * has one batch in flight at a time, nothing downstream can race ahead of
  * this wait. */
@@ -483,9 +442,9 @@ panvk_queue_wait_events(struct panvk_gpu_queue *queue,
    return VK_SUCCESS;
 }
 
-/* Event set/reset itself is left going through panvk_per_arch(event_update)()
- * (implemented in panvk_vX_event.c), which is out of scope for this port --
- * see the port notes at the top of the file. */
+/* Event set/reset is a direct KBASE_IOCTL_SOFT_EVENT_UPDATE call (not an
+ * atom -- see the file-level note), implemented in panvk_vX_event.c via
+ * panvk_per_arch(event_update)(); out of scope for this file. */
 static VkResult
 panvk_queue_signal_events(struct panvk_gpu_queue *queue,
                           struct panvk_batch *batch)
@@ -582,9 +541,11 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* XXX: struct base_jd_atom_v2 only carries a per-atom base_jd_prio value,
-    * not a queue-wide priority negotiated at creation time, so we don't
-    * plumb anything beyond MEDIUM through yet. */
+   /* struct base_jd_atom_v2::prio (base_jd_prio) is per-atom, not
+    * negotiated once at queue/context creation time, so a non-MEDIUM
+    * global priority isn't plumbed through yet. base_jd_prio does have
+    * BASE_JD_PRIO_HIGH/LOW/REALTIME levels available per-atom in
+    * mali_base_jm_kernel.h if this needs extending later. */
    assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
 
    assert(kbase_gfx_dev_kind(device->kmod.dev) == KBASE_GFX_DEV_JM);
@@ -600,7 +561,7 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   /* Job-slot routing (which hardware job slot vertex/tiler vs fragment
+   /* Job-slot routing (which hardware job slot vertex+tiler vs fragment
     * atoms land on) is resolved once here against this device's
     * RAW_JS_FEATURES_<n> GPU properties, read straight off
     * KBASE_IOCTL_GET_GPUPROPS, and stashed per-atom in
@@ -645,9 +606,10 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
       container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
-   /* Nothing JM-specific to tear down here with the raw-ioctl backend: no
-    * per-queue kernel-side context beyond what closing the device fd
-    * already releases at device destruction. */
+   /* KBASE_IOCTL_POST_TERM (ioctl nr 4, _IO with no payload), from
+    * mali_kbase_jm_ioctl.h. Best-effort: the queue is being torn down
+    * regardless of whether this succeeds. */
+   ioctl(dev->kmod.dev->fd, KBASE_IOCTL_POST_TERM);
 
    vk_queue_finish(&queue->vk);
    vk_free(&dev->vk.alloc, queue);
