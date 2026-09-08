@@ -47,8 +47,10 @@ panvk_per_arch(event_update)(struct panvk_device *dev,
    int ret = kbase_jm_soft_event_update(dev->kmod.dev, event->bo->addr.dev,
                                         status);
    if (ret) {
+      /* Plain -1 + errno on failure, same convention as the rest of
+       * kbase_jm.h -- see the note in panvk_queue_jm_submit_atom(). */
       mesa_loge("panvk: kbase_jm_soft_event_update failed: %s",
-                strerror(-ret));
+                strerror(errno));
       return false;
    }
 
