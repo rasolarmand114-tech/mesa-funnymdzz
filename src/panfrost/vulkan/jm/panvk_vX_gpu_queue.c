@@ -45,8 +45,8 @@
  * mali_base_kernel.h's own #include of mali_base_jm_kernel.h). No
  * kbase_jm.h wrapper is used anywhere in this file.
  *
- * FIX (see the big comment above panvk_kbase_pick_job_slot() and inside
- * create_gpu_queue()): the previous version of this file treated
+ * FIX (see the comment inside create_gpu_queue()): the previous version
+ * of this file treated
  * "no single job slot advertises both VERTEX and TILER in its JS_FEATURES"
  * as a *fatal* vkCreateDevice() failure. That check had no functional
  * purpose to begin with: struct base_jd_atom_v2::jobslot is only honoured
@@ -60,27 +60,22 @@
  * via kbase_js_choose_affinity() (see the historical note that used to sit
  * at the top of this file, before any of this GET_GPUPROPS-based slot
  * lookup was added) -- which is exactly the "let the kernel route it"
- * behaviour every other panvk kbase backend relies on. So slot discovery
- * is now best-effort/diagnostic only: we still query and log it (useful
- * for understanding a given board's JS_FEATURES layout), but a miss no
- * longer blocks device creation, and submission only opts into an explicit
- * slot when discovery actually found one.
+ * behaviour every other panvk kbase backend relies on. An earlier revision
+ * of this fix kept the matched slot around and opted into
+ * BASE_JD_REQ_JOB_SLOT whenever a match was found; that turned out to be
+ * actively harmful, because the JS_FEATURE_* bit-position guesses below
+ * aren't reliably correct on real hardware -- a false "match" handed the
+ * kernel an out-of-range jobslot and KBASE_IOCTL_JOB_SUBMIT started
+ * failing outright with EINVAL. So slot discovery is now purely
+ * diagnostic (log-only, in create_gpu_queue()) and its result is never
+ * looked at again by anything that submits work.
  */
 
 /* -----------------------------------------------------------------------
- * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS. Best-effort/diagnostic:
- * see the FIX note above for why a miss here is not fatal.
+ * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS. Log-only/diagnostic --
+ * see the FIX note above. Nothing below this point feeds back into
+ * submission.
  * ----------------------------------------------------------------------- */
-
-/* JS_FEATURES bits (per hardware job-slot capability register). Not part of
- * the uapi headers themselves (those only give the *key* used to fetch the
- * raw register value via GET_GPUPROPS, not the register's own bit layout)
- * -- these come from the public Mali GPU_JS_FEATURES register
- * documentation, flagged here since it's the one piece not sourced
- * directly from the four headers above. */
-#define JS_FEATURE_VERTEX_JOB   (1u << 5)
-#define JS_FEATURE_TILER_JOB    (1u << 7)
-#define JS_FEATURE_FRAGMENT_JOB (1u << 9)
 
 #define PANVK_KBASE_MAX_JOB_SLOTS 16
 
@@ -165,30 +160,6 @@ panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
    return 0;
 }
 
-/* Pick the first present job slot whose advertised JS_FEATURES cover every
- * bit in want_mask. Mirrors what kbase_js_choose_affinity()/mali_kbase_js.c
- * does kernel-side, just done once up front instead of per submission.
- *
- * Returns -1 if nothing matches -- which is a perfectly normal outcome (not
- * every board's JS_FEATURES layout puts vertex+tiler on the same slot, and
- * some kernels don't populate this property at all), not an error. See the
- * FIX note at the top of the file for why the caller must not treat -1 as
- * fatal. */
-static int
-panvk_kbase_pick_job_slot(const struct panvk_kbase_js_features *slots,
-                          uint32_t want_mask)
-{
-   for (uint32_t i = 0; i < PANVK_KBASE_MAX_JOB_SLOTS; i++) {
-      if (!(slots->slot_present_mask & (1u << i)))
-         continue;
-
-      if ((slots->features[i] & want_mask) == want_mask)
-         return (int)i;
-   }
-
-   return -1;
-}
-
 /* -----------------------------------------------------------------------
  * Atom submission via KBASE_IOCTL_JOB_SUBMIT, using the real
  * struct base_jd_atom_v2 from mali_base_jm_kernel.h.
@@ -211,9 +182,14 @@ panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
  * this queue submitted last, and block until it (and therefore everything
  * submitted before it on this queue) has completed.
  *
- * jobslot may be -1, meaning "let the kernel choose" (see the FIX note at
- * the top of the file) -- BASE_JD_REQ_JOB_SLOT is only added to core_req
- * when the caller actually has a discovered slot to offer.
+ * This never sets BASE_JD_REQ_JOB_SLOT / a nonzero .jobslot: the
+ * GET_GPUPROPS-based slot discovery above is diagnostic-only (see the FIX
+ * note at the top of the file) because its JS_FEATURES bit-position
+ * assumptions are not reliably correct across real hardware -- getting
+ * them wrong and asking the kernel to honour an out-of-range jobslot is
+ * what turns into an immediate KBASE_IOCTL_JOB_SUBMIT EINVAL. Leaving the
+ * flag unset makes the kernel pick the job slot itself from the core_req
+ * bits via kbase_js_choose_affinity(), which is always safe.
  *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: a kbase atom's
@@ -224,16 +200,12 @@ panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
  */
 static bool
 panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
-                           base_jd_core_req core_req, int jobslot,
-                           uint64_t jc)
+                           base_jd_core_req core_req, uint64_t jc)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    int fd = dev->kmod.dev->fd;
 
    uint8_t atom_number = panvk_kbase_next_atom_number(queue);
-
-   if (jobslot >= 0)
-      core_req |= BASE_JD_REQ_JOB_SLOT;
 
    struct base_jd_atom_v2 atom = {
       .jc = jc,
@@ -256,7 +228,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       .atom_number = atom_number,
       .prio = BASE_JD_PRIO_MEDIUM,
       .device_nr = 0,
-      .jobslot = jobslot >= 0 ? (uint8_t)jobslot : 0,
+      .jobslot = 0, /* ignored: BASE_JD_REQ_JOB_SLOT is never set below */
       .core_req = core_req,
       .padding = {0},
    };
@@ -358,12 +330,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       /* BASE_JD_REQ_CS covers Vertex/Geometry/Compute Shader jobs;
        * BASE_JD_REQ_T is tiling -- both per their doc comments in
        * mali_base_jm_kernel.h. This job chain contains vertex and tiler
-       * jobs. queue->jm_vt_slot may be -1 (no single slot advertised both
-       * capabilities in JS_FEATURES, or the property wasn't available) --
-       * panvk_queue_jm_submit_atom() treats that as "let the kernel pick",
-       * which is the normal/safe default. */
+       * jobs. Job-slot affinity is left to the kernel -- see the FIX note
+       * at the top of the file. */
       if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_CS | BASE_JD_REQ_T,
-                                      queue->jm_vt_slot,
                                       batch->vtc_jc.first_job))
          return false;
 
@@ -390,10 +359,9 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
-      /* BASE_JD_REQ_FS: "Requires fragment shaders". Same -1-means-auto
-       * handling as above applies to queue->jm_frag_slot. */
+      /* BASE_JD_REQ_FS: "Requires fragment shaders". Job-slot affinity is
+       * left to the kernel -- see the FIX note at the top of the file. */
       if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_FS,
-                                      queue->jm_frag_slot,
                                       batch->frag_jc.first_job))
          return false;
 
@@ -567,41 +535,23 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   /* Job-slot routing is best-effort/diagnostic only -- see the FIX note
-    * at the top of the file. A query or lookup failure here must NOT fail
-    * device creation: struct base_jd_atom_v2::jobslot (and therefore
-    * queue->jm_vt_slot/jm_frag_slot) is only ever consulted by the kernel
-    * when BASE_JD_REQ_JOB_SLOT is set on the atom, which
-    * panvk_queue_jm_submit_atom() only does when it has a slot >= 0 to
-    * offer. Falling back to -1 ("let the kernel choose via
-    * kbase_js_choose_affinity()") is always safe. */
-   queue->jm_vt_slot = -1;
-   queue->jm_frag_slot = -1;
-
+   /* Diagnostic only: log this board's JS_FEATURES layout via
+    * KBASE_IOCTL_GET_GPUPROPS. See the FIX note at the top of the file --
+    * panvk_queue_jm_submit_atom() never sets BASE_JD_REQ_JOB_SLOT and never
+    * reads these values, so nothing here can affect submission and a
+    * query failure is not fatal to device creation. */
    struct panvk_kbase_js_features slots;
    int ret = panvk_kbase_get_js_features(device->kmod.dev->fd, &slots);
    if (ret) {
-      mesa_logw("panvk: failed to query kbase JS_FEATURES via "
-               "KBASE_IOCTL_GET_GPUPROPS: %s -- falling back to "
-               "kernel-chosen job-slot affinity", strerror(errno));
+      mesa_logd("panvk: failed to query kbase JS_FEATURES via "
+               "KBASE_IOCTL_GET_GPUPROPS: %s (non-fatal, diagnostic only)",
+               strerror(errno));
    } else {
       mesa_logd("panvk: kbase RAW_JS_PRESENT=0x%x", slots.slot_present_mask);
       for (uint32_t i = 0; i < PANVK_KBASE_MAX_JOB_SLOTS; i++) {
          if (slots.slot_present_mask & (1u << i))
             mesa_logd("panvk: kbase JS_FEATURES[%u]=0x%x", i,
                       slots.features[i]);
-      }
-
-      queue->jm_vt_slot = panvk_kbase_pick_job_slot(
-         &slots, JS_FEATURE_VERTEX_JOB | JS_FEATURE_TILER_JOB);
-      queue->jm_frag_slot =
-         panvk_kbase_pick_job_slot(&slots, JS_FEATURE_FRAGMENT_JOB);
-
-      if (queue->jm_vt_slot < 0 || queue->jm_frag_slot < 0) {
-         mesa_logd("panvk: no single kbase JM job slot advertises the "
-                   "requested vertex+tiler/fragment JS_FEATURES combo -- "
-                   "falling back to kernel-chosen affinity for the slot(s) "
-                   "that didn't match (this is normal on some boards)");
       }
    }
 
