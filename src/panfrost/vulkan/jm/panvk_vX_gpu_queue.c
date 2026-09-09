@@ -43,44 +43,33 @@
  * headers: mali_kbase_ioctl.h, mali_kbase_jm_ioctl.h, mali_base_kernel.h and
  * mali_base_jm_kernel.h (pulled in transitively via panvk_kbase_uapi.h /
  * mali_base_kernel.h's own #include of mali_base_jm_kernel.h). No
- * kbase_jm.h wrapper is used anywhere in this file. Every ioctl number,
- * struct layout, and flag/enum value referenced below -- struct
- * kbase_ioctl_job_submit, struct base_jd_atom_v2, struct base_dependency,
- * struct base_jd_udata, base_jd_core_req (BASE_JD_REQ_*), base_jd_prio
- * (BASE_JD_PRIO_*), base_jd_dep_type (BASE_JD_DEP_TYPE_*), struct
- * base_jd_event_v2, base_jd_event_code (BASE_JD_EVENT_*),
- * KBASE_IOCTL_GET_GPUPROPS + its KBASE_GPUPROP_* keys, and
- * KBASE_IOCTL_POST_TERM -- comes verbatim from those four headers.
+ * kbase_jm.h wrapper is used anywhere in this file.
  *
- * One thing is genuinely a userspace policy choice, not something read out
- * of the uapi headers, and is called out where it happens below:
- *
- *  - struct base_jd_atom_v2::atom_number is picked by *us*, not assigned by
- *    the kernel -- its doc comment just says "Unique number to identify the
- *    atom", and kbase userspace clients own that numbering (out of the
- *    BASE_JD_ATOM_COUNT-sized space, 0..255, defined in
- *    mali_base_jm_kernel.h). Since this queue only ever has one atom
- *    in flight, a simple counter cycling through 1..255 (skipping 0, which
- *    doubles as the "no dependency" sentinel value for pre_dep) is enough
- *    to guarantee uniqueness against anything still outstanding.
- *
- *  - Which BASE_JD_REQ_* bits to set for the vertex+tiler vs fragment job
- *    chains is likewise a driver policy call, made directly from the
- *    documented meaning of each flag in mali_base_jm_kernel.h (BASE_JD_REQ_
- *    CS covers "Vertex Shader Job, Geometry Shader Job, ... Compute Shader
- *    Job"; BASE_JD_REQ_T is "Requires tiling"; BASE_JD_REQ_FS is "Requires
- *    fragment shaders"), not a struct layout that could be gotten wrong at
- *    the ABI level.
- *
- * Also note: KBASE_IOCTL_SOFT_EVENT_UPDATE (ioctl nr 28, in
- * mali_kbase_jm_ioctl.h) is a direct ioctl, not a soft-job atom, so vkEvent
- * set/reset (panvk_per_arch(event_update)()/event_is_set)(), implemented in
- * panvk_vX_event.c) doesn't touch base_jd_atom_v2 at all; that file is out
- * of scope here and is left calling into those functions as before.
+ * FIX (see the big comment above panvk_kbase_pick_job_slot() and inside
+ * create_gpu_queue()): the previous version of this file treated
+ * "no single job slot advertises both VERTEX and TILER in its JS_FEATURES"
+ * as a *fatal* vkCreateDevice() failure. That check had no functional
+ * purpose to begin with: struct base_jd_atom_v2::jobslot is only honoured
+ * by the kernel "when BASE_JD_REQ_JOB_SLOT is specified" in core_req (see
+ * the @jobslot doc comment in mali_base_jm_kernel.h) -- and this file never
+ * sets that bit, so the discovered slot was never actually consulted at
+ * submission time either way. In other words: we were hard-failing device
+ * creation over a value that, even when found, would have been silently
+ * discarded. Real hardware doesn't need it: leaving BASE_JD_REQ_JOB_SLOT
+ * unset makes the kernel pick the job slot itself from the core_req bits
+ * via kbase_js_choose_affinity() (see the historical note that used to sit
+ * at the top of this file, before any of this GET_GPUPROPS-based slot
+ * lookup was added) -- which is exactly the "let the kernel route it"
+ * behaviour every other panvk kbase backend relies on. So slot discovery
+ * is now best-effort/diagnostic only: we still query and log it (useful
+ * for understanding a given board's JS_FEATURES layout), but a miss no
+ * longer blocks device creation, and submission only opts into an explicit
+ * slot when discovery actually found one.
  */
 
 /* -----------------------------------------------------------------------
- * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS.
+ * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS. Best-effort/diagnostic:
+ * see the FIX note above for why a miss here is not fatal.
  * ----------------------------------------------------------------------- */
 
 /* JS_FEATURES bits (per hardware job-slot capability register). Not part of
@@ -178,7 +167,13 @@ panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
 
 /* Pick the first present job slot whose advertised JS_FEATURES cover every
  * bit in want_mask. Mirrors what kbase_js_choose_affinity()/mali_kbase_js.c
- * does kernel-side, just done once up front instead of per submission. */
+ * does kernel-side, just done once up front instead of per submission.
+ *
+ * Returns -1 if nothing matches -- which is a perfectly normal outcome (not
+ * every board's JS_FEATURES layout puts vertex+tiler on the same slot, and
+ * some kernels don't populate this property at all), not an error. See the
+ * FIX note at the top of the file for why the caller must not treat -1 as
+ * fatal. */
 static int
 panvk_kbase_pick_job_slot(const struct panvk_kbase_js_features *slots,
                           uint32_t want_mask)
@@ -216,6 +211,10 @@ panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
  * this queue submitted last, and block until it (and therefore everything
  * submitted before it on this queue) has completed.
  *
+ * jobslot may be -1, meaning "let the kernel choose" (see the FIX note at
+ * the top of the file) -- BASE_JD_REQ_JOB_SLOT is only added to core_req
+ * when the caller actually has a discovered slot to offer.
+ *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: a kbase atom's
  * dependency can only reference prior atoms *on this same context*, and
@@ -232,6 +231,9 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    int fd = dev->kmod.dev->fd;
 
    uint8_t atom_number = panvk_kbase_next_atom_number(queue);
+
+   if (jobslot >= 0)
+      core_req |= BASE_JD_REQ_JOB_SLOT;
 
    struct base_jd_atom_v2 atom = {
       .jc = jc,
@@ -254,7 +256,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       .atom_number = atom_number,
       .prio = BASE_JD_PRIO_MEDIUM,
       .device_nr = 0,
-      .jobslot = (uint8_t)jobslot,
+      .jobslot = jobslot >= 0 ? (uint8_t)jobslot : 0,
       .core_req = core_req,
       .padding = {0},
    };
@@ -356,7 +358,10 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
       /* BASE_JD_REQ_CS covers Vertex/Geometry/Compute Shader jobs;
        * BASE_JD_REQ_T is tiling -- both per their doc comments in
        * mali_base_jm_kernel.h. This job chain contains vertex and tiler
-       * jobs. */
+       * jobs. queue->jm_vt_slot may be -1 (no single slot advertised both
+       * capabilities in JS_FEATURES, or the property wasn't available) --
+       * panvk_queue_jm_submit_atom() treats that as "let the kernel pick",
+       * which is the normal/safe default. */
       if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_CS | BASE_JD_REQ_T,
                                       queue->jm_vt_slot,
                                       batch->vtc_jc.first_job))
@@ -385,7 +390,8 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    }
 
    if (batch->frag_jc.first_job) {
-      /* BASE_JD_REQ_FS: "Requires fragment shaders". */
+      /* BASE_JD_REQ_FS: "Requires fragment shaders". Same -1-means-auto
+       * handling as above applies to queue->jm_frag_slot. */
       if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_FS,
                                       queue->jm_frag_slot,
                                       batch->frag_jc.first_job))
@@ -561,39 +567,48 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
    if (result != VK_SUCCESS)
       goto err_free_queue;
 
-   /* Job-slot routing (which hardware job slot vertex+tiler vs fragment
-    * atoms land on) is resolved once here against this device's
-    * RAW_JS_FEATURES_<n> GPU properties, read straight off
-    * KBASE_IOCTL_GET_GPUPROPS, and stashed per-atom in
-    * struct base_jd_atom_v2::jobslot at submission time. */
+   /* Job-slot routing is best-effort/diagnostic only -- see the FIX note
+    * at the top of the file. A query or lookup failure here must NOT fail
+    * device creation: struct base_jd_atom_v2::jobslot (and therefore
+    * queue->jm_vt_slot/jm_frag_slot) is only ever consulted by the kernel
+    * when BASE_JD_REQ_JOB_SLOT is set on the atom, which
+    * panvk_queue_jm_submit_atom() only does when it has a slot >= 0 to
+    * offer. Falling back to -1 ("let the kernel choose via
+    * kbase_js_choose_affinity()") is always safe. */
+   queue->jm_vt_slot = -1;
+   queue->jm_frag_slot = -1;
+
    struct panvk_kbase_js_features slots;
    int ret = panvk_kbase_get_js_features(device->kmod.dev->fd, &slots);
    if (ret) {
-      result = panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
-                            "failed to query kbase JS_FEATURES via "
-                            "KBASE_IOCTL_GET_GPUPROPS: %s",
-                            strerror(errno));
-      goto err_finish_queue;
-   }
+      mesa_logw("panvk: failed to query kbase JS_FEATURES via "
+               "KBASE_IOCTL_GET_GPUPROPS: %s -- falling back to "
+               "kernel-chosen job-slot affinity", strerror(errno));
+   } else {
+      mesa_logd("panvk: kbase RAW_JS_PRESENT=0x%x", slots.slot_present_mask);
+      for (uint32_t i = 0; i < PANVK_KBASE_MAX_JOB_SLOTS; i++) {
+         if (slots.slot_present_mask & (1u << i))
+            mesa_logd("panvk: kbase JS_FEATURES[%u]=0x%x", i,
+                      slots.features[i]);
+      }
 
-   queue->jm_vt_slot = panvk_kbase_pick_job_slot(
-      &slots, JS_FEATURE_VERTEX_JOB | JS_FEATURE_TILER_JOB);
-   queue->jm_frag_slot =
-      panvk_kbase_pick_job_slot(&slots, JS_FEATURE_FRAGMENT_JOB);
+      queue->jm_vt_slot = panvk_kbase_pick_job_slot(
+         &slots, JS_FEATURE_VERTEX_JOB | JS_FEATURE_TILER_JOB);
+      queue->jm_frag_slot =
+         panvk_kbase_pick_job_slot(&slots, JS_FEATURE_FRAGMENT_JOB);
 
-   if (queue->jm_vt_slot < 0 || queue->jm_frag_slot < 0) {
-      result = panvk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
-                            "no kbase JM job slot advertises the required "
-                            "vertex+tiler/fragment JS_FEATURES");
-      goto err_finish_queue;
+      if (queue->jm_vt_slot < 0 || queue->jm_frag_slot < 0) {
+         mesa_logd("panvk: no single kbase JM job slot advertises the "
+                   "requested vertex+tiler/fragment JS_FEATURES combo -- "
+                   "falling back to kernel-chosen affinity for the slot(s) "
+                   "that didn't match (this is normal on some boards)");
+      }
    }
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
    return VK_SUCCESS;
 
-err_finish_queue:
-   vk_queue_finish(&queue->vk);
 err_free_queue:
    vk_free(&device->vk.alloc, queue);
    return result;
