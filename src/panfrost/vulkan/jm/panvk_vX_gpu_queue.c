@@ -9,14 +9,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include <errno.h>
-#include <inttypes.h>
-#include <poll.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-
 #include "genxml/gen_macros.h"
 
 #include "decode.h"
@@ -28,298 +20,69 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
-#include "panvk_kbase_uapi.h"
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
+#include "panvk_kbase_uapi.h"
 
+#include "vk_drm_syncobj.h"
 #include "vk_framebuffer.h"
-#include "vk_sync.h"
 
-/*
- * NOTE ON THIS PORT (JM-only, raw kbase ioctl UAPI)
- * ===================================================
- * This talks to /dev/mali* directly through the vendored kbase uapi
- * headers: mali_kbase_ioctl.h, mali_kbase_jm_ioctl.h, mali_base_kernel.h and
- * mali_base_jm_kernel.h (pulled in transitively via panvk_kbase_uapi.h /
- * mali_base_kernel.h's own #include of mali_base_jm_kernel.h). No
- * kbase_jm.h wrapper is used anywhere in this file.
- *
- * FIX #1 (see the comment inside create_gpu_queue()): the previous version
- * of this file treated
- * "no single job slot advertises both VERTEX and TILER in its JS_FEATURES"
- * as a *fatal* vkCreateDevice() failure. That check had no functional
- * purpose to begin with: struct base_jd_atom_v2::jobslot is only honoured
- * by the kernel "when BASE_JD_REQ_JOB_SLOT is specified" in core_req (see
- * the @jobslot doc comment in mali_base_jm_kernel.h) -- and this file never
- * sets that bit, so the discovered slot was never actually consulted at
- * submission time either way. In other words: we were hard-failing device
- * creation over a value that, even when found, would have been silently
- * discarded. Real hardware doesn't need it: leaving BASE_JD_REQ_JOB_SLOT
- * unset makes the kernel pick the job slot itself from the core_req bits
- * via kbase_js_choose_affinity() (see the historical note that used to sit
- * at the top of this file, before any of this GET_GPUPROPS-based slot
- * lookup was added) -- which is exactly the "let the kernel route it"
- * behaviour every other panvk kbase backend relies on. An earlier revision
- * of this fix kept the matched slot around and opted into
- * BASE_JD_REQ_JOB_SLOT whenever a match was found; that turned out to be
- * actively harmful, because the JS_FEATURE_* bit-position guesses below
- * aren't reliably correct on real hardware -- a false "match" handed the
- * kernel an out-of-range jobslot and KBASE_IOCTL_JOB_SUBMIT started
- * failing outright with EINVAL. So slot discovery is now purely
- * diagnostic (log-only, in create_gpu_queue()) and its result is never
- * looked at again by anything that submits work.
- *
- * FIX #2 (see the comment inside panvk_queue_jm_submit_atom()): this file
- * used to submit struct base_jd_atom_v2 (stride = sizeof(base_jd_atom_v2)).
- * mali_kbase_jm_ioctl.h's own changelog claims KBASE_IOCTL_JOB_SUBMIT
- * "supports both [v2 and v3] in parallel" (11.22), but empirically, on the
- * actual kernel driver this device runs, submitting with the v2 stride
- * makes the ioctl fail immediately with EINVAL -- whereas the v3 struct
- * (base_jd_atom, i.e. v2 plus a leading seq_nr) is accepted. So this file
- * now submits base_jd_atom (v3) unconditionally; seq_nr is left at 0
- * ("no sequence grouping"), which is a legal, meaningful value, not just a
- * zero-fill.
- */
+#include "drm-uapi/panfrost_drm.h"
 
-/* -----------------------------------------------------------------------
- * Job-slot discovery via KBASE_IOCTL_GET_GPUPROPS. Log-only/diagnostic --
- * see the FIX note above. Nothing below this point feeds back into
- * submission.
- * ----------------------------------------------------------------------- */
 
-#define PANVK_KBASE_MAX_JOB_SLOTS 16
-
-struct panvk_kbase_js_features {
-   uint32_t slot_present_mask; /* raw JS_PRESENT: bit i set => slot i exists */
-   uint32_t features[PANVK_KBASE_MAX_JOB_SLOTS];
+struct panvk_kbase_event_v2 {
+   uint32_t event_code;
+   uint8_t atom_number;
+   uint8_t padding[3];
+   uint64_t udata[2];
 };
 
-/* Probe-then-fetch per KBASE_IOCTL_GET_GPUPROPS's documented protocol:
- * call once with size=0 to learn the blob size (returned as the ioctl's
- * return value), then again with a buffer of that size. Blob format, from
- * mali_kbase_ioctl.h's own doc comment: a stream of
- *   [u32 LE header = (key << 2) | size_code] [value, size_code bytes]
- * with size_code 00/01/10/11 meaning u8/u16/u32/u64 respectively. */
 static int
-panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
+panvk_kbase_submit_and_wait(int fd, uint64_t jc, uint32_t core_req)
 {
-   memset(out, 0, sizeof(*out));
-
-   struct kbase_ioctl_get_gpuprops probe = {
-      .buffer = 0,
-      .size = 0,
-      .flags = 0,
-   };
-
-   int blob_size = ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &probe);
-   if (blob_size < 0)
-      return -1;
-   if (blob_size == 0)
-      return 0;
-
-   void *blob = malloc((size_t)blob_size);
-   if (!blob) {
-      errno = ENOMEM;
-      return -1;
-   }
-
-   struct kbase_ioctl_get_gpuprops fetch = {
-      .buffer = (uintptr_t)blob,
-      .size = (uint32_t)blob_size,
-      .flags = 0,
-   };
-
-   int ret = ioctl(fd, KBASE_IOCTL_GET_GPUPROPS, &fetch);
-   if (ret < 0) {
-      int saved_errno = errno;
-      free(blob);
-      errno = saved_errno;
-      return -1;
-   }
-
-   const uint8_t *p = blob;
-   const uint8_t *end = p + blob_size;
-
-   while (p + 4 <= end) {
-      uint32_t header = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                        ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-      p += 4;
-
-      uint32_t key = header >> 2;
-      uint32_t size_code = header & 0x3;
-      uint32_t value_size = 1u << size_code; /* 1, 2, 4, or 8 bytes */
-
-      if (p + value_size > end)
-         break;
-
-      uint64_t value = 0;
-      for (uint32_t i = 0; i < value_size; i++)
-         value |= (uint64_t)p[i] << (8 * i);
-      p += value_size;
-
-      if (key == KBASE_GPUPROP_RAW_JS_PRESENT) {
-         out->slot_present_mask = (uint32_t)value;
-      } else if (key >= KBASE_GPUPROP_RAW_JS_FEATURES_0 &&
-                key <= KBASE_GPUPROP_RAW_JS_FEATURES_15) {
-         out->features[key - KBASE_GPUPROP_RAW_JS_FEATURES_0] =
-            (uint32_t)value;
-      }
-   }
-
-   free(blob);
-   return 0;
-}
-
-/* -----------------------------------------------------------------------
- * Atom submission via KBASE_IOCTL_JOB_SUBMIT, using the real
- * struct base_jd_atom (v3) from mali_base_jm_kernel.h.
- * ----------------------------------------------------------------------- */
-
-/* Pick the next atom_number for this queue. base_jd_atom::atom_number is
- * a userspace-owned value (see the file-level note above), out of the
- * BASE_JD_ATOM_COUNT (256) space defined in mali_base_jm_kernel.h. Cycles
- * through 1..255, skipping 0 since a pre_dep referencing atom_id 0 with
- * BASE_JD_DEP_TYPE_INVALID means "no dependency" -- this queue never has
- * more than one atom outstanding, so simple cycling can't collide with
- * anything still in flight. */
-static uint8_t
-panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
-{
-   return (uint8_t)((queue->jm_last_atom % (BASE_JD_ATOM_COUNT - 1)) + 1);
-}
-
-/* Submit a single job chain as one kbase JM atom, chained onto the atom
- * this queue submitted last, and block until it (and therefore everything
- * submitted before it on this queue) has completed.
- *
- * This never sets BASE_JD_REQ_JOB_SLOT / a nonzero .jobslot: the
- * GET_GPUPROPS-based slot discovery above is diagnostic-only (see FIX #1
- * at the top of the file) because its JS_FEATURES bit-position assumptions
- * are not reliably correct across real hardware -- getting them wrong and
- * asking the kernel to honour an out-of-range jobslot is what turns into
- * an immediate KBASE_IOCTL_JOB_SUBMIT EINVAL. Leaving the flag unset makes
- * the kernel pick the job slot itself from the core_req bits via
- * kbase_js_choose_affinity(), which is always safe.
- *
- * This submits struct base_jd_atom (v3: seq_nr + base_jd_atom_v2), not
- * base_jd_atom_v2 directly -- see FIX #2 at the top of the file for why:
- * this device's kernel rejects the v2 stride with EINVAL even though the
- * uapi header's own changelog says both are accepted in parallel. seq_nr
- * is left at 0 ("no sequence grouping"); every other field matches what a
- * v2 submission would have set.
- *
- * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
- * synchronous instead of returning a fence-like object: a kbase atom's
- * dependency can only reference prior atoms *on this same context*, and
- * completion is only observable by draining the shared JM event stream for
- * the device -- there's nothing DRM-syncobj-shaped to export or wait on
- * from outside this function.
- */
-static bool
-panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
-                           base_jd_core_req core_req, uint64_t jc)
-{
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   int fd = dev->kmod.dev->fd;
-
-   uint8_t atom_number = panvk_kbase_next_atom_number(queue);
-
-   struct base_jd_atom atom = {
-      .seq_nr = 0,
-      .jc = jc,
-      .udata = {.blob = {0, 0}},
-      .extres_list = 0,
-      .nr_extres = 0,
-      .jit_id = {0, 0}, /* must be zero, per mali_base_jm_kernel.h */
-      .pre_dep =
-         {
-            {
-               /* jm_last_atom == 0 means "nothing submitted on this queue
-                * yet" -- see the port notes above. */
-               .atom_id = queue->jm_last_atom,
-               .dependency_type = queue->jm_last_atom
-                                     ? BASE_JD_DEP_TYPE_DATA
-                                     : BASE_JD_DEP_TYPE_INVALID,
-            },
-            {.atom_id = 0, .dependency_type = BASE_JD_DEP_TYPE_INVALID},
-         },
-      .atom_number = atom_number,
-      .prio = BASE_JD_PRIO_MEDIUM,
-      .device_nr = 0,
-      .jobslot = 0, /* ignored: BASE_JD_REQ_JOB_SLOT is never set below */
-      .core_req = core_req,
-      .renderpass_id = 0,
-      .padding = {0},
-   };
+     uint8_t atom_bytes[48];
+      memset(atom_bytes, 0, sizeof(atom_bytes));
+   memcpy(atom_bytes + 0, &jc, 8);
+   atom_bytes[40] = 1;
+   memcpy(atom_bytes + 44, &core_req, 4);
 
    struct kbase_ioctl_job_submit submit = {
-      .addr = (uintptr_t)&atom,
+      .addr = (uint64_t)(uintptr_t)atom_bytes,
       .nr_atoms = 1,
-      .stride = sizeof(atom),
+      .stride = 48,
    };
 
-   int ret = ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit);
-   if (ret < 0) {
-      mesa_loge("panvk: KBASE_IOCTL_JOB_SUBMIT failed: %s", strerror(errno));
-      return false;
-   }
+   if (ioctl(fd, KBASE_IOCTL_JOB_SUBMIT, &submit))
+      return -errno;
 
-   queue->jm_last_atom = atom_number;
+   struct pollfd pfd = { .fd = fd, .events = POLLIN };
+   int pret = poll(&pfd, 1, 5000);
+   if (pret <= 0 || !(pfd.revents & POLLIN))
+      return -110;
 
-   /* Only one atom is ever in flight at a time in this submission model,
-    * so the next completion for *this atom_number* is the one we're
-    * waiting for; anything else reported first (there shouldn't be
-    * anything else, but the ABI doesn't promise it) is skipped. */
-   for (;;) {
-      struct pollfd pfd = {.fd = fd, .events = POLLIN};
+   struct panvk_kbase_event_v2 event;
+   ssize_t n = read(fd, &event, sizeof(event));
+   if (n != sizeof(event))
+      return -5;
 
-      int pret;
-      do {
-         pret = poll(&pfd, 1, -1);
-      } while (pret < 0 && errno == EINTR);
+   if (event.event_code != 0x1)
+     return -(int)event.event_code;
 
-      if (pret < 0) {
-         mesa_loge("panvk: poll() on kbase fd failed: %s", strerror(errno));
-         return false;
-      }
-
-      struct base_jd_event_v2 evt;
-      ssize_t rret = read(fd, &evt, sizeof(evt));
-      if (rret < 0) {
-         if (errno == EAGAIN || errno == EINTR)
-            continue;
-         mesa_loge("panvk: read() on kbase fd failed: %s", strerror(errno));
-         return false;
-      }
-      if (rret != (ssize_t)sizeof(evt)) {
-         mesa_loge("panvk: short read on kbase fd (%zd of %zu bytes)", rret,
-                   sizeof(evt));
-         return false;
-      }
-
-      if (evt.atom_number != atom_number)
-         continue;
-
-      if (evt.event_code != BASE_JD_EVENT_DONE) {
-         mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
-                   ") reported failure (event_code=0x%x)",
-                   atom_number, jc, evt.event_code);
-         return false;
-      }
-
-      return true;
-   }
+  return 0;
 }
-
-static bool
+ 
+static void
 panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
                          struct panvk_cmd_buffer *cmdbuf,
-                         struct panvk_batch *batch)
+                         struct panvk_batch *batch, uint32_t *bos,
+                         unsigned nr_bos, uint32_t *in_fences,
+                         unsigned nr_in_fences)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
+   ASSERTED int ret;
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
@@ -347,176 +110,220 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
-      /* BASE_JD_REQ_CS covers Vertex/Geometry/Compute Shader jobs;
-       * BASE_JD_REQ_T is tiling -- both per their doc comments in
-       * mali_base_jm_kernel.h. This job chain contains vertex and tiler
-       * jobs. Job-slot affinity is left to the kernel -- see the FIX note
-       * at the top of the file. */
-      if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_CS | BASE_JD_REQ_T,
-                                      batch->vtc_jc.first_job))
-         return false;
+      
+      ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->vtc_jc.first_job, 0x16) /* PATCH: T|CS|V combined, vtc_jc may contain mixed job types */;
+      assert(!ret);
 
-      /* Submission is always synchronous now, so the work is already done;
-       * this is only about deciding whether to pay for readback/decode. */
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
+
          /* If we want to read the descriptors back, we need to invalidate the
           * whole desc pool, otherwise we might end up with stale data. */
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
          pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
-      if (PANVK_DEBUG(TRACE))
+      if (PANVK_DEBUG(TRACE)) {
+         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
          pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
                       phys_dev->kmod.dev->props.gpu_id);
+      }
 
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if (PANVK_DEBUG(SYNC))
-         pandecode_abort_on_fault(dev->debug.decode_ctx,
-                                  batch->vtc_jc.first_job,
-                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (batch->frag_jc.first_job) {
-      /* BASE_JD_REQ_FS: "Requires fragment shaders". Job-slot affinity is
-       * left to the kernel -- see the FIX note at the top of the file. */
-      if (!panvk_queue_jm_submit_atom(queue, BASE_JD_REQ_FS,
-                                      batch->frag_jc.first_job))
-         return false;
+      ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->frag_jc.first_job, 0x01);
+      assert(!ret);
+      
+         
 
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
+        if (PANVK_DEBUG(TRACE)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-      }
+      
 
-      if (PANVK_DEBUG(TRACE))
+     
          pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
                       phys_dev->kmod.dev->props.gpu_id);
+                      }
 
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
-
-      if (PANVK_DEBUG(SYNC))
-         pandecode_abort_on_fault(dev->debug.decode_ctx,
-                                  batch->frag_jc.first_job,
-                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (PANVK_DEBUG(TRACE))
       pandecode_next_frame(dev->debug.decode_ctx);
 
    batch->issued = true;
-   return true;
 }
 
-/* vkCmdWaitEvents2() operations recorded on this batch. There's no GPU-side
- * soft-event-wait atom we submit here, so we just block the CPU on the
- * host-visible event status until it's set. Because this queue only ever
- * has one batch in flight at a time, nothing downstream can race ahead of
- * this wait. */
-static VkResult
-panvk_queue_wait_events(struct panvk_gpu_queue *queue,
-                        struct panvk_batch *batch)
+static void
+panvk_queue_transfer_sync(struct panvk_gpu_queue *queue, uint32_t syncobj)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   ASSERTED int ret;
 
-   util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
-      if (op->type != PANVK_EVENT_OP_WAIT)
-         continue;
+   struct drm_syncobj_handle handle = {
+      .handle = queue->sync,
+      .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
+      .fd = -1,
+   };
 
-      while (!panvk_per_arch(event_is_set)(op->event)) {
-         if (vk_device_is_lost(&dev->vk))
-            return VK_ERROR_DEVICE_LOST;
+   ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &handle);
+   assert(!ret);
+   assert(handle.fd >= 0);
 
-         thrd_yield();
-      }
-   }
+   handle.handle = syncobj;
+   ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &handle);
+   assert(!ret);
 
-   return VK_SUCCESS;
+   close(handle.fd);
 }
 
-/* Event set/reset is a direct KBASE_IOCTL_SOFT_EVENT_UPDATE call (not an
- * atom -- see the file-level note), implemented in panvk_vX_event.c via
- * panvk_per_arch(event_update)(); out of scope for this file. */
-static VkResult
-panvk_queue_signal_events(struct panvk_gpu_queue *queue,
-                          struct panvk_batch *batch)
+static void
+panvk_add_wait_event_syncobjs(struct panvk_batch *batch, uint32_t *in_fences,
+                              unsigned *nr_in_fences)
 {
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-
    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
       switch (op->type) {
       case PANVK_EVENT_OP_SET:
-         if (!panvk_per_arch(event_update)(dev, op->event,
-                                           KBASE_JM_SOFT_EVENT_SET))
-            return VK_ERROR_DEVICE_LOST;
+         /* Nothing to do yet */
          break;
       case PANVK_EVENT_OP_RESET:
-         if (!panvk_per_arch(event_update)(dev, op->event,
-                                           KBASE_JM_SOFT_EVENT_RESET))
-            return VK_ERROR_DEVICE_LOST;
+         /* Nothing to do yet */
          break;
       case PANVK_EVENT_OP_WAIT:
-         /* Handled up-front in panvk_queue_wait_events(). */
+         in_fences[(*nr_in_fences)++] = op->event->syncobj;
          break;
       default:
          UNREACHABLE("bad panvk_cmd_event_op type\n");
       }
    }
+}
 
-   return VK_SUCCESS;
+static void
+panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
+                            struct panvk_batch *batch)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
+      switch (op->type) {
+      case PANVK_EVENT_OP_SET: {
+         panvk_queue_transfer_sync(queue, op->event->syncobj);
+         break;
+      }
+      case PANVK_EVENT_OP_RESET: {
+         struct panvk_event *event = op->event;
+
+         struct drm_syncobj_array objs = {
+            .handles = (uint64_t)(uintptr_t)&event->syncobj,
+            .count_handles = 1};
+
+         ASSERTED int ret = pan_kmod_ioctl(dev->drm_fd,
+                                  DRM_IOCTL_SYNCOBJ_RESET, &objs);
+         assert(!ret);
+         break;
+      }
+      case PANVK_EVENT_OP_WAIT:
+         /* Nothing left to do */
+         break;
+      default:
+         UNREACHABLE("bad panvk_cmd_event_op type\n");
+      }
+   }
 }
 
 VkResult
-panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue,
-                                 struct vk_queue_submit *submit)
+panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
 {
-   struct panvk_gpu_queue *queue =
-      container_of(vk_queue, struct panvk_gpu_queue, vk);
+   struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   VkResult result;
 
-   /* A kbase atom's dependency can only chain onto prior atoms *on this
-    * same queue*; there's no way to hand it an external semaphore as a
-    * GPU-side dependency. So wait semaphores are resolved on the CPU,
-    * before we submit anything. This queue's own submissions are already
-    * fully synchronous (see panvk_queue_jm_submit_atom()), so this doesn't
-    * give up any pipelining we'd otherwise have had. */
+   unsigned nr_semaphores = submit->wait_count + 1;
+   uint32_t semaphores[nr_semaphores];
+
+   semaphores[0] = queue->sync;
    for (unsigned i = 0; i < submit->wait_count; i++) {
-      result = vk_sync_wait(&dev->vk, submit->waits[i].sync,
-                            submit->waits[i].wait_value,
-                            VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-      if (result != VK_SUCCESS)
-         return result;
+      assert(vk_sync_type_is_drm_syncobj(submit->waits[i].sync->type));
+      struct vk_drm_syncobj *syncobj =
+         vk_sync_as_drm_syncobj(submit->waits[i].sync);
+
+      semaphores[i + 1] = syncobj->syncobj;
    }
 
    for (uint32_t j = 0; j < submit->command_buffer_count; ++j) {
-      struct panvk_cmd_buffer *cmdbuf = container_of(
-         submit->command_buffers[j], struct panvk_cmd_buffer, vk);
+      struct panvk_cmd_buffer *cmdbuf =
+         container_of(submit->command_buffers[j], struct panvk_cmd_buffer, vk);
 
       list_for_each_entry(struct panvk_batch, batch, &cmdbuf->batches, node) {
-         result = panvk_queue_wait_events(queue, batch);
-         if (result != VK_SUCCESS)
-            return result;
+         /* FIXME: should be done at the batch level */
+         unsigned nr_bos = panvk_pool_num_bos(&cmdbuf->desc_pool) +
+                           panvk_pool_num_bos(&cmdbuf->varying_pool) +
+                           panvk_pool_num_bos(&cmdbuf->tls_pool) +
+                           batch->fb.bo_count + (batch->blit.src ? 1 : 0) +
+                           (batch->blit.dst ? 1 : 0) +
+                           (batch->vtc_jc.first_tiler ? 1 : 0) + 1;
+         unsigned bo_idx = 0;
+         uint32_t bos[nr_bos];
 
-         if (!panvk_queue_submit_batch(queue, cmdbuf, batch))
-            return vk_queue_set_lost(&queue->vk,
-                                     "kbase JM atom submission failed");
+         panvk_pool_get_bo_handles(&cmdbuf->desc_pool, &bos[bo_idx]);
+         bo_idx += panvk_pool_num_bos(&cmdbuf->desc_pool);
 
-         result = panvk_queue_signal_events(queue, batch);
-         if (result != VK_SUCCESS)
-            return result;
+         panvk_pool_get_bo_handles(&cmdbuf->varying_pool, &bos[bo_idx]);
+         bo_idx += panvk_pool_num_bos(&cmdbuf->varying_pool);
+
+         panvk_pool_get_bo_handles(&cmdbuf->tls_pool, &bos[bo_idx]);
+         bo_idx += panvk_pool_num_bos(&cmdbuf->tls_pool);
+
+         for (unsigned i = 0; i < batch->fb.bo_count; i++)
+            bos[bo_idx++] = pan_kmod_bo_handle(batch->fb.bos[i]);
+
+         if (batch->blit.src)
+            bos[bo_idx++] = pan_kmod_bo_handle(batch->blit.src);
+
+         if (batch->blit.dst)
+            bos[bo_idx++] = pan_kmod_bo_handle(batch->blit.dst);
+
+         if (batch->vtc_jc.first_tiler)
+            bos[bo_idx++] = pan_kmod_bo_handle(dev->tiler_heap->bo);
+
+         bos[bo_idx++] = pan_kmod_bo_handle(dev->sample_positions->bo);
+         assert(bo_idx == nr_bos);
+
+         /* Merge identical BO entries. */
+         for (unsigned x = 0; x < nr_bos; x++) {
+            for (unsigned y = x + 1; y < nr_bos;) {
+               if (bos[x] == bos[y])
+                  bos[y] = bos[--nr_bos];
+               else
+                  y++;
+            }
+         }
+
+         unsigned nr_in_fences = 0;
+         unsigned max_wait_event_syncobjs = util_dynarray_num_elements(
+            &batch->event_ops, struct panvk_cmd_event_op);
+         uint32_t in_fences[nr_semaphores + max_wait_event_syncobjs];
+         memcpy(in_fences, semaphores, nr_semaphores * sizeof(*in_fences));
+         nr_in_fences += nr_semaphores;
+
+         panvk_add_wait_event_syncobjs(batch, in_fences, &nr_in_fences);
+
+         panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
+                                  nr_in_fences);
+
+         panvk_signal_event_syncobjs(queue, batch);
       }
    }
 
-   /* Every batch above already ran to completion by the time we get here,
-    * so signalling is pure host-side bookkeeping. */
+   /* Transfer the out fence to signal semaphores */
    for (unsigned i = 0; i < submit->signal_count; i++) {
-      result = vk_sync_signal(&dev->vk, submit->signals[i].sync,
-                              submit->signals[i].signal_value);
-      if (result != VK_SUCCESS)
-         return result;
+      assert(vk_sync_type_is_drm_syncobj(submit->signals[i].sync->type));
+      struct vk_drm_syncobj *syncobj =
+         vk_sync_as_drm_syncobj(submit->signals[i].sync);
+
+      panvk_queue_transfer_sync(queue, syncobj->syncobj);
    }
 
    return VK_SUCCESS;
@@ -535,18 +342,11 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* struct base_jd_atom::prio (base_jd_prio) is per-atom, not
-    * negotiated once at queue/context creation time, so a non-MEDIUM
-    * global priority isn't plumbed through yet. base_jd_prio does have
-    * BASE_JD_PRIO_HIGH/LOW/REALTIME levels available per-atom in
-    * mali_base_jm_kernel.h if this needs extending later. */
+   /* XXX: Panfrost kernel module doesn't support priorities so far */
    assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
 
-   assert(kbase_gfx_dev_kind(device->kmod.dev) == KBASE_GFX_DEV_JM);
-
-   struct panvk_gpu_queue *queue =
-      vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
-               VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   struct panvk_gpu_queue *queue = vk_zalloc(&device->vk.alloc, sizeof(*queue), 8,
+                                         VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
    if (!queue)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -554,49 +354,27 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       vk_queue_init(&queue->vk, &device->vk, create_info, queue_idx);
    if (result != VK_SUCCESS)
       goto err_free_queue;
-
-   /* Diagnostic only: log this board's JS_FEATURES layout via
-    * KBASE_IOCTL_GET_GPUPROPS. See FIX #1 at the top of the file --
-    * panvk_queue_jm_submit_atom() never sets BASE_JD_REQ_JOB_SLOT and never
-    * reads these values, so nothing here can affect submission and a
-    * query failure is not fatal to device creation. */
-   struct panvk_kbase_js_features slots;
-   int ret = panvk_kbase_get_js_features(device->kmod.dev->fd, &slots);
-   if (ret) {
-      mesa_logd("panvk: failed to query kbase JS_FEATURES via "
-               "KBASE_IOCTL_GET_GPUPROPS: %s (non-fatal, diagnostic only)",
-               strerror(errno));
-   } else {
-      mesa_logd("panvk: kbase RAW_JS_PRESENT=0x%x", slots.slot_present_mask);
-      for (uint32_t i = 0; i < PANVK_KBASE_MAX_JOB_SLOTS; i++) {
-         if (slots.slot_present_mask & (1u << i))
-            mesa_logd("panvk: kbase JS_FEATURES[%u]=0x%x", i,
-                      slots.features[i]);
-      }
-   }
+      queue->sync = 0;
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
    *out_queue = &queue->vk;
    return VK_SUCCESS;
+
+err_finish_queue:
+   vk_queue_finish(&queue->vk);
 
 err_free_queue:
    vk_free(&device->vk.alloc, queue);
    return result;
 }
 
-void
-panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
+void panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
 {
-   struct panvk_gpu_queue *queue =
-      container_of(vk_queue, struct panvk_gpu_queue, vk);
+   struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(vk_queue->base.device);
 
-   /* KBASE_IOCTL_POST_TERM (ioctl nr 4, _IO with no payload), from
-    * mali_kbase_jm_ioctl.h. Best-effort: the queue is being torn down
-    * regardless of whether this succeeds. */
-   ioctl(dev->kmod.dev->fd, KBASE_IOCTL_POST_TERM);
-
    vk_queue_finish(&queue->vk);
+   /* PATCH: no drm_syncobj to destroy */
    vk_free(&dev->vk.alloc, queue);
 }
 
@@ -620,10 +398,5 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
       u_printf_with_ctx(stdout, &dev->printf.ctx);
       return VK_ERROR_DEVICE_LOST;
    }
-
-   /* panvk_per_arch(gpu_queue_submit)() already blocks until every atom it
-    * submits has completed (see panvk_queue_jm_submit_atom()), so there is
-    * nothing left to wait for by the time control returns to this queue's
-    * caller. */
    return VK_SUCCESS;
 }
