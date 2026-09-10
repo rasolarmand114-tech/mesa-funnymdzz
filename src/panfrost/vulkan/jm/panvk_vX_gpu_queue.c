@@ -45,7 +45,7 @@
  * mali_base_kernel.h's own #include of mali_base_jm_kernel.h). No
  * kbase_jm.h wrapper is used anywhere in this file.
  *
- * FIX (see the comment inside create_gpu_queue()): the previous version
+ * FIX #1 (see the comment inside create_gpu_queue()): the previous version
  * of this file treated
  * "no single job slot advertises both VERTEX and TILER in its JS_FEATURES"
  * as a *fatal* vkCreateDevice() failure. That check had no functional
@@ -69,6 +69,17 @@
  * failing outright with EINVAL. So slot discovery is now purely
  * diagnostic (log-only, in create_gpu_queue()) and its result is never
  * looked at again by anything that submits work.
+ *
+ * FIX #2 (see the comment inside panvk_queue_jm_submit_atom()): this file
+ * used to submit struct base_jd_atom_v2 (stride = sizeof(base_jd_atom_v2)).
+ * mali_kbase_jm_ioctl.h's own changelog claims KBASE_IOCTL_JOB_SUBMIT
+ * "supports both [v2 and v3] in parallel" (11.22), but empirically, on the
+ * actual kernel driver this device runs, submitting with the v2 stride
+ * makes the ioctl fail immediately with EINVAL -- whereas the v3 struct
+ * (base_jd_atom, i.e. v2 plus a leading seq_nr) is accepted. So this file
+ * now submits base_jd_atom (v3) unconditionally; seq_nr is left at 0
+ * ("no sequence grouping"), which is a legal, meaningful value, not just a
+ * zero-fill.
  */
 
 /* -----------------------------------------------------------------------
@@ -162,10 +173,10 @@ panvk_kbase_get_js_features(int fd, struct panvk_kbase_js_features *out)
 
 /* -----------------------------------------------------------------------
  * Atom submission via KBASE_IOCTL_JOB_SUBMIT, using the real
- * struct base_jd_atom_v2 from mali_base_jm_kernel.h.
+ * struct base_jd_atom (v3) from mali_base_jm_kernel.h.
  * ----------------------------------------------------------------------- */
 
-/* Pick the next atom_number for this queue. base_jd_atom_v2::atom_number is
+/* Pick the next atom_number for this queue. base_jd_atom::atom_number is
  * a userspace-owned value (see the file-level note above), out of the
  * BASE_JD_ATOM_COUNT (256) space defined in mali_base_jm_kernel.h. Cycles
  * through 1..255, skipping 0 since a pre_dep referencing atom_id 0 with
@@ -183,13 +194,20 @@ panvk_kbase_next_atom_number(struct panvk_gpu_queue *queue)
  * submitted before it on this queue) has completed.
  *
  * This never sets BASE_JD_REQ_JOB_SLOT / a nonzero .jobslot: the
- * GET_GPUPROPS-based slot discovery above is diagnostic-only (see the FIX
- * note at the top of the file) because its JS_FEATURES bit-position
- * assumptions are not reliably correct across real hardware -- getting
- * them wrong and asking the kernel to honour an out-of-range jobslot is
- * what turns into an immediate KBASE_IOCTL_JOB_SUBMIT EINVAL. Leaving the
- * flag unset makes the kernel pick the job slot itself from the core_req
- * bits via kbase_js_choose_affinity(), which is always safe.
+ * GET_GPUPROPS-based slot discovery above is diagnostic-only (see FIX #1
+ * at the top of the file) because its JS_FEATURES bit-position assumptions
+ * are not reliably correct across real hardware -- getting them wrong and
+ * asking the kernel to honour an out-of-range jobslot is what turns into
+ * an immediate KBASE_IOCTL_JOB_SUBMIT EINVAL. Leaving the flag unset makes
+ * the kernel pick the job slot itself from the core_req bits via
+ * kbase_js_choose_affinity(), which is always safe.
+ *
+ * This submits struct base_jd_atom (v3: seq_nr + base_jd_atom_v2), not
+ * base_jd_atom_v2 directly -- see FIX #2 at the top of the file for why:
+ * this device's kernel rejects the v2 stride with EINVAL even though the
+ * uapi header's own changelog says both are accepted in parallel. seq_nr
+ * is left at 0 ("no sequence grouping"); every other field matches what a
+ * v2 submission would have set.
  *
  * See the big comment on panvk_gpu_queue::jm_last_atom for why this is
  * synchronous instead of returning a fence-like object: a kbase atom's
@@ -207,7 +225,8 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
 
    uint8_t atom_number = panvk_kbase_next_atom_number(queue);
 
-   struct base_jd_atom_v2 atom = {
+   struct base_jd_atom atom = {
+      .seq_nr = 0,
       .jc = jc,
       .udata = {.blob = {0, 0}},
       .extres_list = 0,
@@ -230,6 +249,7 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       .device_nr = 0,
       .jobslot = 0, /* ignored: BASE_JD_REQ_JOB_SLOT is never set below */
       .core_req = core_req,
+      .renderpass_id = 0,
       .padding = {0},
    };
 
@@ -515,7 +535,7 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* struct base_jd_atom_v2::prio (base_jd_prio) is per-atom, not
+   /* struct base_jd_atom::prio (base_jd_prio) is per-atom, not
     * negotiated once at queue/context creation time, so a non-MEDIUM
     * global priority isn't plumbed through yet. base_jd_prio does have
     * BASE_JD_PRIO_HIGH/LOW/REALTIME levels available per-atom in
@@ -536,7 +556,7 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       goto err_free_queue;
 
    /* Diagnostic only: log this board's JS_FEATURES layout via
-    * KBASE_IOCTL_GET_GPUPROPS. See the FIX note at the top of the file --
+    * KBASE_IOCTL_GET_GPUPROPS. See FIX #1 at the top of the file --
     * panvk_queue_jm_submit_atom() never sets BASE_JD_REQ_JOB_SLOT and never
     * reads these values, so nothing here can affect submission and a
     * query failure is not fatal to device creation. */
