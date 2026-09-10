@@ -61,6 +61,48 @@
 #include "pan_props.h"
 #include "pan_trace.h"
 
+/* -------------------------------------------------------------------------
+ * Pulling in BOTH the JM and CSF ioctl definitions in one file
+ *
+ * mali_kbase_ioctl.h (included above via drm-uapi/) only ever pulls in ONE
+ * of mali_kbase_csf_ioctl.h / mali_kbase_jm_ioctl.h, selected at compile
+ * time by MALI_USE_CSF -- fine for a client that only ever talks to one
+ * kbase flavour, but this file talks to *both* from a single binary,
+ * decided at runtime by the handshake in kbase_kmod_dev_create() below.
+ * This build never defines MALI_USE_CSF, so the include above resolved to
+ * mali_kbase_jm_ioctl.h, which is why every KBASE_IOCTL_CS_*/KBASE_IOCTL_
+ * KCPU_* name used further down in this file (queue groups, KCPU queues,
+ * tiler heaps -- all CSF-only) needs kbase_csf_uapi.h included here too.
+ *
+ * The two headers agree on everything except one thing: the version-check
+ * ioctl. Both declare `struct kbase_ioctl_version_check` (identical
+ * layout) and both `#define KBASE_IOCTL_VERSION_CHECK` /
+ * `_RESERVED`, but on swapped ioctl numbers (JM: nr 0 real / nr 52
+ * reserved; CSF: nr 52 real / nr 0 reserved) -- because nr 52 is
+ * deliberately a no-op on a JM kernel and nr 0 is deliberately a no-op on
+ * a CSF kernel, which is exactly the property kbase_kmod_dev_create()
+ * relies on to tell the two flavours apart safely. Directly including
+ * both headers back to back would therefore fail with "redefinition of
+ * struct kbase_ioctl_version_check". Since kbase_csf_uapi.h's own pair
+ * already fully describes both numbers, we don't need the JM header's
+ * copies at all: shadow the one colliding struct tag for the duration of
+ * this #include (struct tags are ordinary identifiers and *are*
+ * macro-substituted, unlike #define target names) and undef the two
+ * colliding macros first so redefining them isn't a warning either. */
+#define kbase_ioctl_version_check kbase_ioctl_version_check_jm_unused
+#undef KBASE_IOCTL_VERSION_CHECK
+#undef KBASE_IOCTL_VERSION_CHECK_RESERVED
+#include "kbase_csf_uapi.h"
+#undef kbase_ioctl_version_check
+
+/* From here on, "CSF" and "JM" always mean what kbase_kmod_dev_create()'s
+ * own handshake comment says they mean: nr 52 really only answers on a
+ * CSF kernel, nr 0 really only answers on a JM kernel. Both numbers are
+ * available from kbase_csf_uapi.h's own pair (see above), so this is the
+ * only place either macro needs to be defined. */
+#define KBASE_IOCTL_VERSION_CHECK_CSF KBASE_IOCTL_VERSION_CHECK
+#define KBASE_IOCTL_VERSION_CHECK_JM  KBASE_IOCTL_VERSION_CHECK_RESERVED
+
 /* Forward declaration — the full definition is at the end of this file. */
 const struct pan_kmod_ops kbase_kmod_ops;
 
