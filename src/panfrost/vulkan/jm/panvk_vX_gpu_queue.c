@@ -30,6 +30,7 @@
 
 #include "drm-uapi/panfrost_drm.h"
 
+#include <poll.h>
 
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
@@ -110,16 +111,13 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
-      
       ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->vtc_jc.first_job, 0x16) /* PATCH: T|CS|V combined, vtc_jc may contain mixed job types */;
       assert(!ret);
 
-
-         /* If we want to read the descriptors back, we need to invalidate the
-          * whole desc pool, otherwise we might end up with stale data. */
-         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
-         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-      }
+      /* If we want to read the descriptors back, we need to invalidate the
+       * whole desc pool, otherwise we might end up with stale data. */
+      panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+      pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
       if (PANVK_DEBUG(TRACE)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
@@ -129,23 +127,17 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
 
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
-
    }
 
    if (batch->frag_jc.first_job) {
       ret = panvk_kbase_submit_and_wait(dev->drm_fd, batch->frag_jc.first_job, 0x01);
       assert(!ret);
-      
-         
 
-        if (PANVK_DEBUG(TRACE)) {
+      if (PANVK_DEBUG(TRACE)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
-      
-
-     
          pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
                       phys_dev->kmod.dev->props.gpu_id);
-                      }
+      }
 
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
