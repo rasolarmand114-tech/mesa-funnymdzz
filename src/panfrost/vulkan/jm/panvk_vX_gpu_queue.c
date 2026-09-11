@@ -9,7 +9,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "../../lib/kmod/kbase_jm.h"
 
 #include <errno.h>
 #include <inttypes.h>
