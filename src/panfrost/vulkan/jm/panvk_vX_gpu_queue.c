@@ -35,6 +35,7 @@
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
 #include "../../lib/kmod/kbase_jm.h"
+#include "drm-uapi/mali_kbase_ioctl.h"
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
