@@ -30,11 +30,11 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
-#include "panvk_kbase_uapi.h"
+
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
-
+#include "../../lib/kmod/kbase_jm.h"
 #include "vk_framebuffer.h"
 #include "vk_sync.h"
 
