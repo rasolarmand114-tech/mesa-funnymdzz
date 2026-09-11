@@ -29,7 +29,7 @@
 #include "vk_framebuffer.h"
 
 #include "drm-uapi/panfrost_drm.h"
-
+#include <poll.h>
 
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
