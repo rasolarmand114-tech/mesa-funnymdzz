@@ -19,6 +19,12 @@
 struct panvk_gpu_queue {
    struct vk_queue vk;
    uint32_t sync;
+
+   /* Last kbase JM atom_number submitted on this queue (0 = none yet).
+    * Used to chain each new atom's pre_dep onto the previous one, since
+    * this queue only ever has one atom in flight at a time. See
+    * panvk_queue_jm_submit_atom() in panvk_vX_gpu_queue.c. */
+   uint8_t jm_last_atom;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_gpu_queue, vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
