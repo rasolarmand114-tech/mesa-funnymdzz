@@ -70,7 +70,6 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 #include "panvk_instance.h"
-#include "panvk_kbase_uapi.h"
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_queue.h"
@@ -378,6 +377,29 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    return true;
 }
 
+/* TODO(verify): struct panvk_event (panvk_event.h) only carries a plain
+ * uint32_t `syncobj` field -- there is no panvk_per_arch(event_is_set)/
+ * (event_update)() declared anywhere in this codebase, so a version of
+ * this file calling them could never have linked. Until
+ * panvk_vX_event.c's real mechanism for that field is confirmed, this
+ * treats `syncobj` directly as a plain 0/1 flag via atomic builtins, so
+ * at least sets/waits within this process are data-race-free. This does
+ * NOT yet know how panvk_vX_event.c / panvk_vX_cmd_event.c expect
+ * `syncobj` to be used (it may need to be a real kernel syncobj handle
+ * instead), so treat vkSetEvent/vkResetEvent/vkCmdWaitEvents as
+ * unverified until that file is checked against this. */
+static bool
+panvk_kbase_event_is_set(struct panvk_event *event)
+{
+   return __atomic_load_n(&event->syncobj, __ATOMIC_ACQUIRE) != 0;
+}
+
+static void
+panvk_kbase_event_set(struct panvk_event *event, bool set)
+{
+   __atomic_store_n(&event->syncobj, set ? 1u : 0u, __ATOMIC_RELEASE);
+}
+
 /* vkCmdWaitEvents2() operations recorded on this batch. There's no GPU-side
  * soft-event-wait atom we submit here, so -- same spirit as the
  * synchronous atom submission above -- we just block the CPU on the
@@ -394,7 +416,7 @@ panvk_queue_wait_events(struct panvk_gpu_queue *queue,
       if (op->type != PANVK_EVENT_OP_WAIT)
          continue;
 
-      while (!panvk_per_arch(event_is_set)(op->event)) {
+      while (!panvk_kbase_event_is_set(op->event)) {
          if (vk_device_is_lost(&dev->vk))
             return VK_ERROR_DEVICE_LOST;
 
@@ -409,17 +431,13 @@ static VkResult
 panvk_queue_signal_events(struct panvk_gpu_queue *queue,
                           struct panvk_batch *batch)
 {
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-
    util_dynarray_foreach(&batch->event_ops, struct panvk_cmd_event_op, op) {
       switch (op->type) {
       case PANVK_EVENT_OP_SET:
-         if (!panvk_per_arch(event_update)(dev, op->event, 1 /* SET */))
-            return VK_ERROR_DEVICE_LOST;
+         panvk_kbase_event_set(op->event, true);
          break;
       case PANVK_EVENT_OP_RESET:
-         if (!panvk_per_arch(event_update)(dev, op->event, 0 /* RESET */))
-            return VK_ERROR_DEVICE_LOST;
+         panvk_kbase_event_set(op->event, false);
          break;
       case PANVK_EVENT_OP_WAIT:
          /* Handled up-front in panvk_queue_wait_events(). */
