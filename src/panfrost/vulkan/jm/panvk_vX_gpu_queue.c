@@ -24,23 +24,34 @@
  * that silently produced no declarations for reasons we couldn't pin
  * down, etc). Chasing that across several rounds of CI cost more time
  * than the kbase ioctl surface used here is actually worth: this file
- * only needs 3 ioctls (VERSION_CHECK, JOB_SUBMIT) and reads one small,
- * fixed-layout event struct, all of which are small, stable, and public
- * ABI that hasn't changed since UK 10.2 (base_jd_atom_v2) --
- * cf. mali_base_kernel.h / mali_kbase_ioctl.h in any Mali GPU kernel
- * driver tree, e.g.
- * https://android.googlesource.com/kernel/hikey-linaro/+/android-hikey-linaro-4.9/drivers/gpu/arm_gpu/mali_kbase_ioctl.h
- * and https://android.googlesource.com/kernel/hikey-linaro/+/android-hikey-linaro-4.9/drivers/gpu/arm_gpu/mali_base_kernel.h
+ * only needs 2 ioctls (VERSION_CHECK, JOB_SUBMIT) and reads one small,
+ * fixed-layout event struct.
  *
  * So: everything this file needs from the kbase uAPI is declared right
  * here, under a "panvk_kbase_" prefix that cannot collide with anything
  * any other header in this translation unit defines. No external kbase
- * header is included. This is the entire dependency surface, verified
- * against the public kernel sources linked above:
+ * header is included.
+ *
+ * IMPORTANT -- atom struct is base_jd_atom (v3), NOT base_jd_atom_v2:
+ * an earlier revision of this file submitted the 56-byte
+ * base_jd_atom_v2 layout (no seq_nr) and every KBASE_IOCTL_JOB_SUBMIT
+ * came back EINVAL. Confirmed on-device with a minimal standalone
+ * ioctl test (UAPI negotiates as 11.46 on this kernel/DDK, i.e. the
+ * "R54P1"-era job manager): switching the submitted struct to the
+ * 64-byte layout with `seq_nr` as its first member (`jc` moves to
+ * offset 8) made JOB_SUBMIT succeed immediately, with everything else
+ * about the call unchanged. That 64-byte/seq_nr layout is exactly
+ * `struct base_jd_atom` in mali_base_jm_kernel.h ("Same as
+ * base_jd_atom_v2, but has an extra seq_nr at the beginning" + a
+ * trailing renderpass_id byte where v2 just has more padding) -- so
+ * this DDK's JOB_SUBMIT only accepts the v3 shape; v2 is rejected
+ * outright (presumably on a hard-coded server-side
+ * `stride == sizeof(struct base_jd_atom)` check, since the rejection
+ * was immediate and had nothing to do with core_req or jc content).
  *
  *   - KBASE_IOCTL_VERSION_CHECK   = _IOWR(0x80, 0, {u16 major, u16 minor})
  *   - KBASE_IOCTL_JOB_SUBMIT      = _IOW (0x80, 2, {u64 addr, u32 nr_atoms, u32 stride})
- *   - struct base_jd_atom_v2 (56 bytes, see layout below)
+ *   - struct base_jd_atom   (v3, 64 bytes, see layout below) -- what we submit
  *   - struct base_jd_event_v2 (24 bytes: u32 event_code, u8 atom_number,
  *     u8 pad[3], u64 udata[2])
  *   - BASE_JD_EVENT_DONE = 0x01
@@ -100,25 +111,31 @@ struct panvk_kbase_dependency {
 };
 #define PANVK_KBASE_DEP_TYPE_DATA 1
 
-/* struct base_jd_atom_v2, byte-for-byte: 56 bytes total, no implicit
- * padding beyond the kernel's own trailing `padding[8]` -- every field
- * here already falls on its natural alignment boundary in this exact
- * order, so this struct's layout matches the real kernel ABI on both
- * aarch64 and x86_64 without needing __attribute__((packed)). */
-struct panvk_kbase_atom_v2 {
-   uint64_t jc;                            /* offset 0 */
-   uint64_t udata[2];                      /* offset 8  (base_jd_udata) */
-   uint64_t extres_list;                   /* offset 24 */
-   uint16_t nr_extres;                     /* offset 32 */
-   uint8_t jit_id[2];                      /* offset 34 */
-   struct panvk_kbase_dependency pre_dep[2]; /* offset 36 */
-   uint8_t atom_number;                    /* offset 40 */
-   uint8_t prio;                           /* offset 41 */
-   uint8_t device_nr;                      /* offset 42 */
-   uint8_t jobslot;                        /* offset 43 */
-   uint32_t core_req;                      /* offset 44 */
-   uint8_t padding[8];                     /* offset 48 */
-};                                          /* size 56 */
+/* struct base_jd_atom (v3), byte-for-byte: 64 bytes total. This is
+ * base_jd_atom_v2 with a `seq_nr` prepended and one byte of its trailing
+ * padding repurposed as `renderpass_id` -- see the big comment at the
+ * top of this file for why v3 (not v2) is what this kernel actually
+ * accepts. Every field still falls on its natural alignment boundary in
+ * this order, so no __attribute__((packed)) is needed on either aarch64
+ * or x86_64. */
+struct panvk_kbase_atom {
+   uint64_t seq_nr;                        /* offset 0  */
+   uint64_t jc;                            /* offset 8  */
+   uint64_t udata[2];                      /* offset 16 (base_jd_udata) */
+   uint64_t extres_list;                   /* offset 32 */
+   uint16_t nr_extres;                     /* offset 40 */
+   uint8_t jit_id[2];                      /* offset 42 */
+   struct panvk_kbase_dependency pre_dep[2]; /* offset 44 */
+   uint8_t atom_number;                    /* offset 48 */
+   uint8_t prio;                           /* offset 49 */
+   uint8_t device_nr;                      /* offset 50 */
+   uint8_t jobslot;                        /* offset 51 */
+   uint32_t core_req;                      /* offset 52 */
+   uint8_t renderpass_id;                  /* offset 56 */
+   uint8_t padding[7];                     /* offset 57 */
+};                                          /* size 64 */
+_Static_assert(sizeof(struct panvk_kbase_atom) == 64,
+               "base_jd_atom (v3) must be 64 bytes");
 
 #define PANVK_KBASE_JD_REQ_FS ((uint32_t)1 << 0) /* fragment job     */
 #define PANVK_KBASE_JD_REQ_CS ((uint32_t)1 << 1) /* vertex/geom job  */
@@ -126,7 +143,10 @@ struct panvk_kbase_atom_v2 {
 
 #define PANVK_KBASE_JD_PRIO_MEDIUM 0
 
-/* struct base_jd_event_v2, byte-for-byte: 24 bytes. */
+/* struct base_jd_event_v2, byte-for-byte: 24 bytes. Unlike the atom
+ * struct, the event struct did NOT change shape between v2 and v3 --
+ * only the submitted atom did -- so this is unaffected by the fix
+ * above. */
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
    uint8_t atom_number;
@@ -199,13 +219,20 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    if (atom_number == 0)
       atom_number = 1;
 
-   struct panvk_kbase_atom_v2 atom = {
+   struct panvk_kbase_atom atom = {
+      /* No logical grouping of atoms beyond ordinary pre_dep chaining,
+       * so seq_nr just mirrors atom_number. */
+      .seq_nr = atom_number,
       .jc = jc,
       .core_req = kind == PANVK_KBASE_ATOM_FRAGMENT
                      ? PANVK_KBASE_JD_REQ_FS
                      : (PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T),
       .atom_number = atom_number,
       .prio = PANVK_KBASE_JD_PRIO_MEDIUM,
+      /* renderpass_id is only meaningful with BASE_JD_REQ_START/END_RENDERPASS,
+       * which we don't use (no JM incremental rendering here) -- 0 is
+       * "not part of a renderpass". */
+      .renderpass_id = 0,
    };
 
    if (queue->jm_last_atom != 0) {
@@ -517,7 +544,7 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *device,
       priority_info ? priority_info->globalPriority
                     : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
 
-   /* XXX: struct base_jd_atom_v2 only carries a per-atom BASE_JD_PRIO_*
+   /* XXX: struct base_jd_atom only carries a per-atom BASE_JD_PRIO_*
     * value, not a queue-wide priority negotiated at creation time, so we
     * don't plumb anything beyond MEDIUM through yet. */
    assert(priority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
