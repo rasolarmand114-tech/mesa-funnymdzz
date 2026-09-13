@@ -1,3 +1,4 @@
+
 /*
  * Copyright © 2021 Collabora Ltd.
  *
@@ -24,8 +25,8 @@
  * that silently produced no declarations for reasons we couldn't pin
  * down, etc). Chasing that across several rounds of CI cost more time
  * than the kbase ioctl surface used here is actually worth: this file
- * only needs 2 ioctls (VERSION_CHECK, JOB_SUBMIT) and reads one small,
- * fixed-layout event struct.
+ * only needs 3 ioctls (VERSION_CHECK, GET_GPUPROPS, JOB_SUBMIT) and
+ * reads one small, fixed-layout event struct.
  *
  * So: everything this file needs from the kbase uAPI is declared right
  * here, under a "panvk_kbase_" prefix that cannot collide with anything
@@ -39,17 +40,29 @@
  * ioctl test (UAPI negotiates as 11.46 on this kernel/DDK, i.e. the
  * "R54P1"-era job manager): switching the submitted struct to the
  * 64-byte layout with `seq_nr` as its first member (`jc` moves to
- * offset 8) made JOB_SUBMIT succeed immediately, with everything else
- * about the call unchanged. That 64-byte/seq_nr layout is exactly
- * `struct base_jd_atom` in mali_base_jm_kernel.h ("Same as
- * base_jd_atom_v2, but has an extra seq_nr at the beginning" + a
- * trailing renderpass_id byte where v2 just has more padding) -- so
- * this DDK's JOB_SUBMIT only accepts the v3 shape; v2 is rejected
- * outright (presumably on a hard-coded server-side
- * `stride == sizeof(struct base_jd_atom)` check, since the rejection
- * was immediate and had nothing to do with core_req or jc content).
+ * offset 8) made JOB_SUBMIT succeed immediately. That 64-byte/seq_nr
+ * layout is exactly `struct base_jd_atom` in mali_base_jm_kernel.h
+ * ("Same as base_jd_atom_v2, but has an extra seq_nr at the beginning"
+ * + a trailing renderpass_id byte where v2 just has more padding) --
+ * so this DDK's JOB_SUBMIT only accepts the v3 shape.
+ *
+ * IMPORTANT #2 -- explicit job-slot selection, not automatic:
+ * with the v3 atom fixed, JOB_SUBMIT started being *accepted*, but the
+ * submitted atom then sat forever with no completion event and no
+ * fault event either, until our own watchdog timed it out ("device is
+ * either stuck or its watchdog didn't fire"). Total silence like that
+ * -- not a fault, not a completion -- is the signature of an atom that
+ * the kernel queued but could never actually dispatch to a job slot:
+ * i.e. leaving `core_req` to auto-select a slot doesn't reliably route
+ * a combined vertex+tiler (CS|T) requirement to a slot that actually
+ * supports both on this device/kernel. The fix is to not guess: read
+ * the real per-slot JS_FEATURES bits via KBASE_IOCTL_GET_GPUPROPS,
+ * pick a slot whose features are a superset of what this atom kind
+ * needs, and pin the atom to it with BASE_JD_REQ_JOB_SLOT + `jobslot`
+ * instead of leaving slot selection implicit.
  *
  *   - KBASE_IOCTL_VERSION_CHECK   = _IOWR(0x80, 0, {u16 major, u16 minor})
+ *   - KBASE_IOCTL_GET_GPUPROPS    = _IOW (0x80, 3, {u64 buffer, u32 size, u32 flags})
  *   - KBASE_IOCTL_JOB_SUBMIT      = _IOW (0x80, 2, {u64 addr, u32 nr_atoms, u32 stride})
  *   - struct base_jd_atom   (v3, 64 bytes, see layout below) -- what we submit
  *   - struct base_jd_event_v2 (24 bytes: u32 event_code, u8 atom_number,
@@ -105,6 +118,14 @@ struct panvk_kbase_job_submit {
 #define PANVK_KBASE_IOCTL_JOB_SUBMIT \
    _IOW(PANVK_KBASE_IOCTL_TYPE, 2, struct panvk_kbase_job_submit)
 
+struct panvk_kbase_get_gpuprops {
+   uint64_t buffer;
+   uint32_t size;
+   uint32_t flags;
+};
+#define PANVK_KBASE_IOCTL_GET_GPUPROPS \
+   _IOW(PANVK_KBASE_IOCTL_TYPE, 3, struct panvk_kbase_get_gpuprops)
+
 struct panvk_kbase_dependency {
    uint8_t atom_id;
    uint8_t dependency_type;
@@ -137,16 +158,16 @@ struct panvk_kbase_atom {
 _Static_assert(sizeof(struct panvk_kbase_atom) == 64,
                "base_jd_atom (v3) must be 64 bytes");
 
-#define PANVK_KBASE_JD_REQ_FS ((uint32_t)1 << 0) /* fragment job     */
-#define PANVK_KBASE_JD_REQ_CS ((uint32_t)1 << 1) /* vertex/geom job  */
-#define PANVK_KBASE_JD_REQ_T  ((uint32_t)1 << 2) /* tiler job        */
+#define PANVK_KBASE_JD_REQ_FS       ((uint32_t)1 << 0)  /* fragment job     */
+#define PANVK_KBASE_JD_REQ_CS       ((uint32_t)1 << 1)  /* vertex/geom job  */
+#define PANVK_KBASE_JD_REQ_T        ((uint32_t)1 << 2)  /* tiler job        */
+#define PANVK_KBASE_JD_REQ_JOB_SLOT ((uint32_t)1 << 17) /* honor `jobslot`  */
 
 #define PANVK_KBASE_JD_PRIO_MEDIUM 0
 
 /* struct base_jd_event_v2, byte-for-byte: 24 bytes. Unlike the atom
  * struct, the event struct did NOT change shape between v2 and v3 --
- * only the submitted atom did -- so this is unaffected by the fix
- * above. */
+ * only the submitted atom did -- so this is unaffected by that fix. */
 struct panvk_kbase_event_v2 {
    uint32_t event_code;
    uint8_t atom_number;
@@ -157,11 +178,170 @@ struct panvk_kbase_event_v2 {
 #define PANVK_KBASE_JD_EVENT_DONE 0x01
 
 /* --------------------------------------------------------------------- */
+/* GET_GPUPROPS + JM job-slot discovery                                  */
+/* --------------------------------------------------------------------- */
+
+/* Raw gpuprop keys, from KBASE_GPUPROP_RAW_JS_PRESENT /
+ * KBASE_GPUPROP_RAW_JS_FEATURES_0 in mali_kbase_ioctl.h. JS_PRESENT is a
+ * bitmask of which of the (up to 16) job slot indices exist on this GPU;
+ * JS_FEATURES_<n> is the JS_FEATURES register content for slot n, whose
+ * bits say which job types (vertex/tiler/fragment/...) that slot can
+ * run. */
+#define PANVK_KBASE_GPUPROP_RAW_JS_PRESENT    34
+#define PANVK_KBASE_GPUPROP_RAW_JS_FEATURES_0 35
+
+#define PANVK_KBASE_JSn_FEATURE_VERTEX   (1u << 2)
+#define PANVK_KBASE_JSn_FEATURE_TILER    (1u << 7)
+#define PANVK_KBASE_JSn_FEATURE_FRAGMENT (1u << 12)
+
+#define PANVK_KBASE_MAX_JOB_SLOTS 16
+
+struct panvk_kbase_job_slots {
+   bool queried;
+   bool valid;
+   uint32_t slot_count;
+   uint32_t features[PANVK_KBASE_MAX_JOB_SLOTS];
+};
+
+/* GET_GPUPROPS returns a tightly packed buffer of (key, value) pairs: a
+ * u32 header (key << 2 | log2(value_size)) immediately followed by the
+ * value, repeated back to back with no padding. */
+static uint64_t
+panvk_kbase_gpuprop_get(const uint8_t *buf, size_t buf_size,
+                        uint32_t target_key, uint64_t default_val)
+{
+   size_t offset = 0;
+
+   while (offset + 4 <= buf_size) {
+      uint32_t hdr;
+      memcpy(&hdr, buf + offset, 4);
+      offset += 4;
+
+      uint32_t key = hdr >> 2;
+      uint32_t size_code = hdr & 0x3;
+      uint32_t val_size = 1u << size_code;
+
+      if (offset + val_size > buf_size)
+         break;
+
+      if (key == target_key) {
+         uint64_t val = 0;
+         memcpy(&val, buf + offset, val_size);
+         return val;
+      }
+
+      offset += val_size;
+   }
+
+   return default_val;
+}
+
+/* Queried once per process and cached: which JM job slot(s) this GPU
+ * has, and what each one's JS_FEATURES register advertises. See
+ * "IMPORTANT #2" at the top of this file for why we ask instead of
+ * assuming the kernel will route a combined vertex+tiler atom to the
+ * right slot on its own. */
+static struct panvk_kbase_job_slots *
+panvk_kbase_get_job_slots(int fd)
+{
+   static struct panvk_kbase_job_slots slots;
+
+   if (slots.queried)
+      return slots.valid ? &slots : NULL;
+
+   slots.queried = true;
+
+   struct panvk_kbase_get_gpuprops req = {0};
+   int ret = ioctl(fd, PANVK_KBASE_IOCTL_GET_GPUPROPS, &req);
+   if (ret < 0) {
+      mesa_loge("panvk: KBASE_IOCTL_GET_GPUPROPS (probe) failed: %s",
+                strerror(errno));
+      return NULL;
+   }
+
+   size_t size = (size_t)ret;
+   if (size == 0) {
+      mesa_loge("panvk: KBASE_IOCTL_GET_GPUPROPS returned zero size");
+      return NULL;
+   }
+
+   uint8_t *buf = malloc(size);
+   if (!buf)
+      return NULL;
+
+   req.buffer = (uintptr_t)buf;
+   req.size = (uint32_t)size;
+
+   if (ioctl(fd, PANVK_KBASE_IOCTL_GET_GPUPROPS, &req) < 0) {
+      mesa_loge("panvk: KBASE_IOCTL_GET_GPUPROPS (fill) failed: %s",
+                strerror(errno));
+      free(buf);
+      return NULL;
+   }
+
+   uint32_t js_present = (uint32_t)panvk_kbase_gpuprop_get(
+      buf, size, PANVK_KBASE_GPUPROP_RAW_JS_PRESENT, 0);
+
+   uint32_t slot_count = 0;
+   for (uint32_t slot = 0; slot < PANVK_KBASE_MAX_JOB_SLOTS; slot++) {
+      if (!(js_present & (1u << slot)))
+         continue;
+
+      slots.features[slot_count] = (uint32_t)panvk_kbase_gpuprop_get(
+         buf, size, PANVK_KBASE_GPUPROP_RAW_JS_FEATURES_0 + slot, 0);
+      slot_count++;
+   }
+   free(buf);
+
+   if (slot_count == 0) {
+      mesa_loge("panvk: JS_PRESENT reported zero job slots (0x%x)",
+                js_present);
+      return NULL;
+   }
+
+   slots.slot_count = slot_count;
+   slots.valid = true;
+
+   for (uint32_t i = 0; i < slot_count; i++)
+      mesa_logd("panvk: JS%u features=0x%08x%s%s%s", i, slots.features[i],
+                (slots.features[i] & PANVK_KBASE_JSn_FEATURE_VERTEX)
+                   ? " VERTEX" : "",
+                (slots.features[i] & PANVK_KBASE_JSn_FEATURE_TILER)
+                   ? " TILER" : "",
+                (slots.features[i] & PANVK_KBASE_JSn_FEATURE_FRAGMENT)
+                   ? " FRAGMENT" : "");
+
+   return &slots;
+}
+
+/* --------------------------------------------------------------------- */
 
 enum panvk_kbase_atom_kind {
    PANVK_KBASE_ATOM_VERTEX_TILER,
    PANVK_KBASE_ATOM_FRAGMENT,
 };
+
+static int
+panvk_kbase_pick_job_slot(int fd, enum panvk_kbase_atom_kind kind)
+{
+   struct panvk_kbase_job_slots *slots = panvk_kbase_get_job_slots(fd);
+   if (!slots)
+      return -1;
+
+   uint32_t required = kind == PANVK_KBASE_ATOM_FRAGMENT
+                           ? PANVK_KBASE_JSn_FEATURE_FRAGMENT
+                           : (PANVK_KBASE_JSn_FEATURE_VERTEX |
+                              PANVK_KBASE_JSn_FEATURE_TILER);
+
+   for (uint32_t i = 0; i < slots->slot_count; i++) {
+      if ((slots->features[i] & required) == required)
+         return (int)i;
+   }
+
+   mesa_loge("panvk: no JM job slot advertises the JS_FEATURES atom kind "
+             "%d needs (0x%x)", kind, required);
+   return -1;
+}
 
 /* Upper bound on how long we'll wait for a single JM atom to complete
  * before giving up and declaring the device lost, instead of blocking
@@ -211,6 +391,10 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    int fd = dev->kmod.dev->fd;
 
+   int jobslot = panvk_kbase_pick_job_slot(fd, kind);
+   if (jobslot < 0)
+      return false;
+
    /* Atom numbers are a u8 (BASE_JD_ATOM_COUNT == 256) and 0 is reserved
     * to mean "no dependency" in pre_dep, so cycle through 1..255. Since
     * this queue only ever has one atom in flight, there's no risk of
@@ -219,16 +403,20 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
    if (atom_number == 0)
       atom_number = 1;
 
+   uint32_t core_req = (kind == PANVK_KBASE_ATOM_FRAGMENT
+                            ? PANVK_KBASE_JD_REQ_FS
+                            : (PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T)) |
+                        PANVK_KBASE_JD_REQ_JOB_SLOT;
+
    struct panvk_kbase_atom atom = {
       /* No logical grouping of atoms beyond ordinary pre_dep chaining,
        * so seq_nr just mirrors atom_number. */
       .seq_nr = atom_number,
       .jc = jc,
-      .core_req = kind == PANVK_KBASE_ATOM_FRAGMENT
-                     ? PANVK_KBASE_JD_REQ_FS
-                     : (PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T),
+      .core_req = core_req,
       .atom_number = atom_number,
       .prio = PANVK_KBASE_JD_PRIO_MEDIUM,
+      .jobslot = (uint8_t)jobslot,
       /* renderpass_id is only meaningful with BASE_JD_REQ_START/END_RENDERPASS,
        * which we don't use (no JM incremental rendering here) -- 0 is
        * "not part of a renderpass". */
@@ -269,10 +457,11 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       int64_t remaining_ns = deadline_ns - now_ns;
       if (remaining_ns <= 0) {
          mesa_loge("panvk: timed out waiting for kbase JM atom %u (job "
-                   "chain 0x%" PRIx64 ") to complete -- device is either "
-                   "stuck or its watchdog didn't fire; treating this queue "
-                   "as lost instead of hanging forever",
-                   atom_number, jc);
+                   "chain 0x%" PRIx64 ", slot %d) to complete -- device "
+                   "is either stuck or its watchdog didn't fire; "
+                   "treating this queue as lost instead of hanging "
+                   "forever",
+                   atom_number, jc, jobslot);
          return false;
       }
 
