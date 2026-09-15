@@ -292,6 +292,14 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
       cfg.sample_pattern = pan_sample_pattern(fb->sample_count);
+#if PAN_ARCH >= 9
+      /* Valhall selects the provoking vertex in the tiler context rather than
+       * per-draw. jm_emit_tiler_desc() in src/gallium/drivers/panfrost/pan_jm.c
+       * sets this under the same #if; without it the tiler uses the wrong
+       * winding for the first vertex. */
+      cfg.first_provoking_vertex =
+         cmdbuf->state.gfx.render.first_provoking_vertex == U_TRISTATE_YES;
+#endif
    }
 
    memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
