@@ -181,9 +181,150 @@ struct panvk_kbase_atom {
 _Static_assert(sizeof(struct panvk_kbase_atom) == 64,
                "base_jd_atom (v3) must be 64 bytes");
 
-#define PANVK_KBASE_JD_REQ_FS ((uint32_t)1 << 0) /* fragment job    */
-#define PANVK_KBASE_JD_REQ_CS ((uint32_t)1 << 1) /* vertex/geom job */
-#define PANVK_KBASE_JD_REQ_T  ((uint32_t)1 << 2) /* tiler job       */
+/* --------------------------------------------------------------------- *
+ * base_jd_core_req (JM) -- every bit this field defines, not just the
+ * three panvk currently issues.
+ *
+ * This layout has been stable since the r5p0-era kbase UAPI (bits 5-8
+ * were reserved BASE_MEM_HINT_* placeholders back then; they were
+ * reused for EVENT_COALESCE/COHERENT_GROUP/PERMON/EXTERNAL_RESOURCES
+ * once MEM_HINT was dropped) straight through every later JM release,
+ * this "R54P1"-era one included: JM stopped gaining job-chain features
+ * once ARM's active development moved to the CSF path for Valhall, so
+ * these bit assignments are frozen, not just "current for this driver
+ * version". Verified against ARM's own GPL kbase UAPI headers across
+ * several driver vintages (a b_r10p0 tree, and JS/JD/JM sources from a
+ * modern Android GKI tree that still ships the `#if !MALI_USE_CSF` JM
+ * path alongside CSF) -- not against an r54p1 tree directly, since
+ * ARM's kbase source isn't public past what OEM kernel drops mirror.
+ *
+ * core_req is a plain OR-able u32 bitmask; the *kernel* job scheduler
+ * (never userspace) uses it to choose a job slot -- see IMPORTANT #2
+ * above -- so nothing below ever selects a slot directly.
+ */
+
+/* --- HW job-type bits. Together with BASE_JD_REQ_SOFT_JOB, these are
+ * mutually exclusive "what kind of atom is this" bits -- see
+ * PANVK_KBASE_JD_REQ_ATOM_TYPE below. --- */
+#define PANVK_KBASE_JD_REQ_DEP ((uint32_t)0)
+   /* No requirement: dependency-only atom, runs nothing on the GPU.
+    * Exists so a pure ordering edge can still be expressed as an atom. */
+#define PANVK_KBASE_JD_REQ_FS ((uint32_t)1 << 0) /* fragment job */
+#define PANVK_KBASE_JD_REQ_CS ((uint32_t)1 << 1)
+   /* Vertex, geometry, *or* compute job -- "CS" here is a Midgard-era
+    * job-type name and predates, and is unrelated to, Vulkan's
+    * VK_QUEUE_COMPUTE_BIT. Compare PANVK_KBASE_JD_REQ_ONLY_COMPUTE
+    * below, which narrows this to just the compute case. */
+#define PANVK_KBASE_JD_REQ_T ((uint32_t)1 << 2) /* tiler job */
+#define PANVK_KBASE_JD_REQ_CF ((uint32_t)1 << 3)
+   /* HW cache-flush job -- a distinct job *type*, unrelated to the
+    * SW SKIP_CACHE_START/END bits further down. Unused by panvk. */
+#define PANVK_KBASE_JD_REQ_V ((uint32_t)1 << 4)
+   /* HW value-writeback job. Unused by panvk. */
+
+/* --- SW-only bits: interpreted by the kbase driver: the job-slot HW
+ * itself never sees them. --- */
+#define PANVK_KBASE_JD_REQ_EVENT_COALESCE ((uint32_t)1 << 5)
+   /* Suppress this atom's own completion event; it's folded into
+    * whichever later atom completes without this bit set. MUST stay
+    * unset here: panvk_queue_jm_submit_atom() submits one atom and
+    * blocks reading *that atom's own* event (see the poll/read loop
+    * above) -- coalescing it away would make that read wait for some
+    * later atom's event instead, which on a queue with only ever one
+    * atom in flight may never come. Also mutually exclusive with
+    * EXTERNAL_RESOURCES per the kbase UAPI. */
+#define PANVK_KBASE_JD_REQ_COHERENT_GROUP ((uint32_t)1 << 6)
+   /* "Needs some coherent core group, don't care which." A scheduler
+    * fairness hint for compute atoms sharing the GPU with other
+    * contexts (see kbase_js_defs.h's coherent-group-contention
+    * tracking) -- irrelevant to correctness on this single-context,
+    * one-atom-in-flight queue. Not set. */
+#define PANVK_KBASE_JD_REQ_PERMON ((uint32_t)1 << 7)
+   /* Enable HW performance counters only around this atom, to save
+    * power otherwise. Not wired up: nothing reaches this file to say
+    * whether a performance-counter capture is active (that lives in
+    * panvk's own perf-counter path, not in panvk_gpu_queue). Left as
+    * an extension point -- see panvk_kbase_core_req_build() below. */
+#define PANVK_KBASE_JD_REQ_EXTERNAL_RESOURCES ((uint32_t)1 << 8)
+   /* Atom's extres_list/nr_extres (see struct panvk_kbase_atom above)
+    * carry external resources needing residency tracking. This is a
+    * derived bit, not a free choice: required exactly when
+    * nr_extres > 0, which this file currently never populates -- see
+    * panvk_kbase_core_req_build() below. */
+#define PANVK_KBASE_JD_REQ_SOFT_JOB ((uint32_t)1 << 9)
+   /* Software-defined job: never touches the GPU, just tells kbase to
+    * perform some bookkeeping action (fence signal/wait, JIT
+    * alloc/free, event set/reset/wait, ...). panvk's own
+    * PANVK_EVENT_OP_* handling is done entirely in userspace (see
+    * panvk_kbase_event_is_set()/panvk_kbase_event_set() below), not
+    * through a kbase soft job, so none of the SOFT_* subtypes below
+    * are ever issued by this file today; listed because the user asked
+    * for every case core_req's value space defines, not just the ones
+    * in current use. */
+#define PANVK_KBASE_JD_REQ_SOFT_JOB_TYPE (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x1f)
+   /* Mask to recover a soft job's exact subtype: AND core_req against
+    * this, then compare for equality against one of the SOFT_*
+    * defines below (each already includes the SOFT_JOB bit itself). */
+#define PANVK_KBASE_JD_REQ_SOFT_DUMP_CPU_GPU_TIME (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x1)
+#define PANVK_KBASE_JD_REQ_SOFT_FENCE_TRIGGER     (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x2)
+#define PANVK_KBASE_JD_REQ_SOFT_FENCE_WAIT        (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x3)
+#define PANVK_KBASE_JD_REQ_SOFT_REPLAY            (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x4)
+#define PANVK_KBASE_JD_REQ_SOFT_EVENT_WAIT        (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x5)
+#define PANVK_KBASE_JD_REQ_SOFT_EVENT_SET         (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x6)
+#define PANVK_KBASE_JD_REQ_SOFT_EVENT_RESET       (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x7)
+#define PANVK_KBASE_JD_REQ_SOFT_DEBUG_COPY        (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x8)
+#define PANVK_KBASE_JD_REQ_SOFT_JIT_ALLOC         (PANVK_KBASE_JD_REQ_SOFT_JOB | 0x9)
+#define PANVK_KBASE_JD_REQ_SOFT_JIT_FREE          (PANVK_KBASE_JD_REQ_SOFT_JOB | 0xa)
+#define PANVK_KBASE_JD_REQ_SOFT_EXT_RES_MAP       (PANVK_KBASE_JD_REQ_SOFT_JOB | 0xb)
+#define PANVK_KBASE_JD_REQ_SOFT_EXT_RES_UNMAP     (PANVK_KBASE_JD_REQ_SOFT_JOB | 0xc)
+#define PANVK_KBASE_JD_REQ_ONLY_COMPUTE ((uint32_t)1 << 10)
+   /* HW: job chain is Compute-Shader jobs *only*, as opposed to the
+    * broader CS bit above which also covers Vertex/Geometry. panvk
+    * only ever issues combined vertex+tiler chains (CS|T, see
+    * PANVK_KBASE_ATOM_VERTEX_TILER below) or fragment chains (FS),
+    * never a compute-only chain, so this stays unset; kept as an
+    * extension point for a future compute-only JM queue. */
+#define PANVK_KBASE_JD_REQ_SPECIFIC_COHERENT_GROUP ((uint32_t)1 << 11)
+   /* HW: pin to the core group named by the atom's device_nr, instead
+    * of "any" (COHERENT_GROUP above); only guaranteed meaningful for
+    * ONLY_COMPUTE atoms, and takes priority if both are set. Not
+    * used; device_nr is left at its zero-initialized value. */
+#define PANVK_KBASE_JD_REQ_EVENT_ONLY_ON_FAILURE ((uint32_t)1 << 12)
+   /* SW: suppress the completion event on success, still send it on
+    * failure. Not set, for the same reason as EVENT_COALESCE: this
+    * driver's wait loop needs the event on every completion, success
+    * or not, to know when to stop polling. */
+#define PANVK_KBASE_JD_REQ_FS_AFBC ((uint32_t)1 << 13)
+   /* SW: this fragment job's colour output targets an AFBC-encoded
+    * surface. Only meaningful together with FS. This file has no
+    * visibility into the batch's framebuffer image layout/modifier,
+    * so it's derived from a caller-supplied flag rather than guessed
+    * here -- see fb_targets_afbc in panvk_kbase_core_req_build(). */
+#define PANVK_KBASE_JD_REQ_EVENT_NEVER ((uint32_t)1 << 14)
+   /* SW: never send a completion event, success or failure. Never
+    * set, for the same reason EVENT_COALESCE isn't: this driver's own
+    * wait loop is the only consumer of that event. */
+#define PANVK_KBASE_JD_REQ_SKIP_CACHE_START ((uint32_t)1 << 15)
+#define PANVK_KBASE_JD_REQ_SKIP_CACHE_END   ((uint32_t)1 << 16)
+   /* SW: skip the GPU-side cache clean/invalidate the job-manager HW
+    * would otherwise do before/after this atom. Neither is set: the
+    * fragment atom consumes the vertex/tiler atom's output (and BOs
+    * are shared across batches on this queue), so every atom needs
+    * the HW's normal inter-job cache maintenance to actually run.
+    * (Separate mechanism from the CPU-side
+    * pan_kmod_flush_bo_map_syncs() calls elsewhere in this file, which
+    * manage CPU/GPU mapping coherency, not the GPU's own L2.) Bit 17
+    * and above are unused/reserved in base_jd_core_req -- see
+    * BASEP_JD_REQ_RESERVED in the real UAPI header -- which is also
+    * why the old per-atom "jobslot" hack in IMPORTANT #2 above was
+    * always a no-op: there was never a bit there to read. */
+
+/* Mask of the bits that select the atom's *type*; dependency-only
+ * atoms are still allowed to carry the rest of core_req around them. */
+#define PANVK_KBASE_JD_REQ_ATOM_TYPE                                       \
+   (PANVK_KBASE_JD_REQ_FS | PANVK_KBASE_JD_REQ_CS | PANVK_KBASE_JD_REQ_T | \
+    PANVK_KBASE_JD_REQ_CF | PANVK_KBASE_JD_REQ_V |                        \
+    PANVK_KBASE_JD_REQ_SOFT_JOB | PANVK_KBASE_JD_REQ_ONLY_COMPUTE)
 
 #define PANVK_KBASE_JD_PRIO_MEDIUM 0
 
@@ -350,8 +491,18 @@ panvk_queue_jm_submit_atom(struct panvk_gpu_queue *queue,
       if (n == 0 || (size_t)n < sizeof(evt))
          continue;
 
+      /* NOTE: this kernel/DDK does not echo back the atom_number we
+       * submitted (confirmed on-device: submitted atom_number=1, event
+       * came back with atom_number=0) -- so it cannot be used to match
+       * events to submissions. That's fine here: this queue only ever
+       * has exactly one atom outstanding at a time (fully synchronous,
+       * see the big comment above), so the first event we read after
+       * submitting is unambiguously the one we're waiting for,
+       * regardless of what its atom_number field says. */
       if (evt.atom_number != atom_number)
-         continue;
+         mesa_logd("panvk: kbase JM event atom_number=%u != submitted "
+                   "atom_number=%u (expected quirk on this DDK, not an "
+                   "error)", evt.atom_number, atom_number);
 
       if (evt.event_code != PANVK_KBASE_JD_EVENT_DONE) {
          mesa_loge("panvk: kbase JM atom %u (job chain 0x%" PRIx64
