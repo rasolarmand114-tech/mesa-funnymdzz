@@ -94,7 +94,7 @@ struct panvk_rendering_state {
       /* nr_samples to be used before framebuffer / tiler descriptor are emitted */
       uint32_t nr_samples;
 
-#if PAN_ARCH < 9
+#if PAN_ARCH < 10  /* PATCH: off-by-one -- v9 (JM) masih butuh field-field ini, batas seharusnya <10 */
       uint32_t bo_count;
       struct pan_kmod_bo *bos[(MAX_RTS * PANVK_MAX_PLANES) + 2];
       bool needs_load;
@@ -218,7 +218,7 @@ struct panvk_cmd_graphics_state {
       unsigned count;
    } vb;
 
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 9  /* PATCH: off-by-one, sama pola seperti tsd -- harusnya >=9 bukan >=10 */
    struct {
       uint32_t base_instance;
       uint32_t attribs_changing_on_base_instance;
@@ -244,7 +244,7 @@ struct panvk_cmd_graphics_state {
    uint64_t vpd;
 #endif
 
-#if PAN_ARCH >= 10
+#if PAN_ARCH >= 9  /* PATCH: off-by-one -- v9 (Mali-G57) jatuh di celah, harusnya >= 9 bukan >= 10 */
    uint64_t tsd;
 #endif
 
