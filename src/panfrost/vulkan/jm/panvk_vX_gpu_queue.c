@@ -550,59 +550,53 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
-      bool ok = panvk_queue_jm_submit_atom(
-         queue, PANVK_KBASE_ATOM_VERTEX_TILER, batch->vtc_jc.first_job);
+      if (!panvk_queue_jm_submit_atom(queue, PANVK_KBASE_ATOM_VERTEX_TILER,
+                                      batch->vtc_jc.first_job))
+         return false;
 
-      /* Decode/abort-on-fault must NOT be skipped just because this atom
-       * already failed -- that's exactly the case where the dump is
-       * worth the most. Run it whenever a debug flag is on, OR the atom
-       * itself failed. */
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || !ok) {
+      /* Submission is always synchronous now, so the work is already done;
+       * this is only about deciding whether to pay for readback/decode. */
+      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
          /* If we want to read the descriptors back, we need to invalidate the
           * whole desc pool, otherwise we might end up with stale data. */
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
          pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
-      if (PANVK_DEBUG(TRACE) || !ok)
+      if (PANVK_DEBUG(TRACE))
          pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
                       phys_dev->kmod.dev->props.gpu_id);
 
-      if (PANVK_DEBUG(DUMP) || !ok)
+      if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if (PANVK_DEBUG(SYNC) || !ok)
+      if (PANVK_DEBUG(SYNC))
          pandecode_abort_on_fault(dev->debug.decode_ctx,
                                   batch->vtc_jc.first_job,
                                   phys_dev->kmod.dev->props.gpu_id);
-
-      if (!ok)
-         return false;
    }
 
    if (batch->frag_jc.first_job) {
-      bool ok = panvk_queue_jm_submit_atom(
-         queue, PANVK_KBASE_ATOM_FRAGMENT, batch->frag_jc.first_job);
+      if (!panvk_queue_jm_submit_atom(queue, PANVK_KBASE_ATOM_FRAGMENT,
+                                      batch->frag_jc.first_job))
+         return false;
 
-      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC) || !ok) {
+      if (PANVK_DEBUG(TRACE) || PANVK_DEBUG(SYNC)) {
          panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
          pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
-      if (PANVK_DEBUG(TRACE) || !ok)
+      if (PANVK_DEBUG(TRACE))
          pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
                       phys_dev->kmod.dev->props.gpu_id);
 
-      if (PANVK_DEBUG(DUMP) || !ok)
+      if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
-      if (PANVK_DEBUG(SYNC) || !ok)
+      if (PANVK_DEBUG(SYNC))
          pandecode_abort_on_fault(dev->debug.decode_ctx,
                                   batch->frag_jc.first_job,
                                   phys_dev->kmod.dev->props.gpu_id);
-
-      if (!ok)
-         return false;
    }
 
    if (PANVK_DEBUG(TRACE))
