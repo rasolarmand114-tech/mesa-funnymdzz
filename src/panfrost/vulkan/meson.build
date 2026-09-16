@@ -210,6 +210,10 @@ libvulkan_panfrost = shared_library(
     inc_include,
     inc_src,
     inc_panfrost,
+     ],
+    override_options : [
+    'b_lto=false',
+    'b_pgo=off',
   ],
   link_whole : [panvk_per_arch_libs],
   link_with : [
