@@ -35,6 +35,36 @@ panvk_wsi_proc_addr(VkPhysicalDevice physicalDevice, const char *pName)
 static bool
 panvk_can_present_on_device(VkPhysicalDevice pdevice, int fd)
 {
+   /* BUG (was unconditional): this hook exists purely so a driver can
+    * tell WSI "rendering and scanout are the same device, skip the
+    * PRIME/foreign-device blit path" -- see Danylo Piliaiev's original
+    * tu_wsi_can_present_on_device() (MR!11091), which this was copied
+    * from. It assumes `fd` is a real DRM fd and asks drmGetDevice2()
+    * whether its bus type is PLATFORM.
+    *
+    * Under kbase, `fd` is the kbase device node (e.g. /dev/mali0), not
+    * a DRM fd at all -- there is no KMS/render node behind it, so
+    * drmGetDevice2() can only ever fail on it, and this function
+    * unconditionally returned false whenever kbase was in use. That
+    * forces WSI down the "different device, blit via PRIME" path on
+    * every present -- and on Termux/Android there is no second, real
+    * display-controller device for that path to blit *to* in the first
+    * place. Falling into that path with nothing on the other end is a
+    * strong candidate for "submits and completes every frame, window
+    * never updates": the app-visible submit/acquire/present calls can
+    * all return VK_SUCCESS while the actual scanout step has nothing
+    * valid to do.
+    *
+    * A kbase-driven Mali GPU is a platform-bus device by construction
+    * (there's no PCI/USB Mali), which is exactly the case the DRM check
+    * below was trying to detect -- so the correct, direct translation
+    * for kbase is to skip the DRM query entirely and answer "yes".
+    */
+   VK_FROM_HANDLE(panvk_physical_device, pdev, pdevice);
+
+   if (pdev->kbase_node_path[0] != '\0')
+      return true;
+
    drmDevicePtr device;
    if (drmGetDevice2(fd, 0, &device) != 0)
       return false;
