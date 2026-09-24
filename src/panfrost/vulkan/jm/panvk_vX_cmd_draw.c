@@ -24,14 +24,16 @@
 #include "panvk_image.h"
 #include "panvk_image_view.h"
 
-/* PATCH: seluruh jalur draw grafis (vertex/tiler/fragment) di file ini masih
- * ditulis untuk Bifrost (RENDERER_STATE/rsd, dst) dan BELUM diadaptasi untuk
- * v9/Valhall -- itu pekerjaan porting terpisah yang jauh lebih besar dari
- * compute. Untuk PAN_ARCH >= 9, kode asli di-skip dan diganti stub kosong
- * (lihat #else di akhir file) supaya libvulkan_panfrost.so bisa selesai
- * di-link dan compute (yang sudah diadaptasi di jm_panvk_vX_cmd_dispatch.c)
- * bisa divalidasi malam ini. Draw call APA PUN lewat jalur ini akan
- * no-op/gagal untuk v9 sampai porting grafisnya dikerjakan. */
+/* PATCH (UPDATED): seluruh jalur draw grafis (vertex/tiler/fragment) di file
+ * ini awalnya ditulis untuk Bifrost (RENDERER_STATE/rsd, dst). Untuk
+ * PAN_ARCH >= 9 (lihat #else di akhir file) jalur ini SEKARANG SUDAH
+ * diadaptasi: draw non-indirect (CmdDraw/CmdDrawIndexed) dikodekan lewat
+ * MALI_JOB_TYPE_MALLOC_VERTEX (IDVS) satu job per draw, disubmit sebagai
+ * atom vertex/tiler kbase JM (lihat panvk_vX_gpu_queue.c, DDK "R54P1" --
+ * struct base_jd_atom v3/64-byte, tanpa pre_dep antar-atom) -- BUKAN lagi
+ * stub kosong. Yang masih belum diimplementasikan untuk v9: CmdDrawIndirect*
+ * (stub, lihat TODO di bawah) dan multi-layer/multiview (hanya layer 0
+ * di-encode, lihat TODO di dekat prepare_draw_v9()). */
 #include "panvk_instance.h"
 #include "panvk_meta.h"
 #include "panvk_priv_bo.h"
@@ -1974,9 +1976,9 @@ panvk_per_arch(CmdEndRendering)(VkCommandBuffer commandBuffer)
 /* PATCH v9 -- BAGIAN 1: disalin verbatim dari csf/panvk_vX_cmd_draw.c
  * (v10+, production-tested). Dikonfirmasi 100% CPU-only, nol dependensi
  * cs_* (command-stream builder CSF-only) -- portable ke JM/v9 tanpa
- * modifikasi struktural. Belum dipanggil dari mana pun (CmdDraw masih
- * stub di bawah) -- ini baru memvalidasi bagian ini compile bersih
- * berdiri sendiri, sebelum disambung ke job encoding draw yang sebenarnya. */
+ * modifikasi struktural. Dipanggil dari prepare_gfx_desc() (BAGIAN 1b, di
+ * bawah), yang pada gilirannya dipanggil dari prepare_draw_v9() sebelum
+ * job MALLOC_VERTEX di-encode -- lihat BAGIAN 3. */
 
 static void
 emit_vs_attrib(struct panvk_cmd_buffer *cmdbuf,
@@ -2265,8 +2267,10 @@ prepare_gfx_desc(struct panvk_cmd_buffer *cmdbuf)
 /* PATCH v9 -- BAGIAN 2: isi state vertex (POSITION, Shader Environment) dan
  * fragment (DRAW, struct Draw pendek v9) untuk Malloc Vertex Job.
  * ADAPTASI dari panvk_emit_vertex_dcd/panvk_emit_tiler_dcd Bifrost --
- * nama field genxml v9 dari riset kita sendiri (compute + genxml grep),
- * BELUM tervalidasi compile. Belum dipanggil dari mana pun. */
+ * nama field genxml v9 dari riset kita sendiri (compute + genxml grep).
+ * Sudah compile dan dipanggil dari panvk_draw_prepare_malloc_vertex_job()
+ * (BAGIAN 3, di bawah); field-field yang paling belum "battle-tested" --
+ * flags_1.render_target_mask/sample_mask -- ditandai di tempatnya. */
 
 static void
 panvk_emit_vs_position_v9(struct panvk_cmd_buffer *cmdbuf,
@@ -2484,9 +2488,6 @@ panvk_emit_fs_draw_v9(struct panvk_cmd_buffer *cmdbuf,
       cfg.flags_1.render_target_mask =
          cmdbuf->state.gfx.render.bound_attachments &
          MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
-      fprintf(stderr, "[PANVK_DEBUG_FLAGS1] sample_mask=0x%x render_target_mask=0x%x bound_attachments=0x%x\n",
-              cfg.flags_1.sample_mask, cfg.flags_1.render_target_mask,
-              cmdbuf->state.gfx.render.bound_attachments);
 
       /* PATCH v9 Draw.vertex_array: genxml comment eksplisit bilang
        * Pointer/stride "Written by hardware in MallocVertexShader job
@@ -2599,12 +2600,20 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
    pan_section_pack(ptr.cpu, MALLOC_VERTEX_JOB, PRIMITIVE, cfg) {
       cfg.draw_mode = translate_prim(draw->info.prim);
       cfg.index_count = draw->info.vertex.count;
-      cfg.base_vertex_offset = 0;
 
-      if (draw->info.index.index_size) {
+      /* draw->info.vertex.base already holds the right value in both
+       * cases -- vertexOffset for CmdDrawIndexed, firstVertex for a
+       * plain CmdDraw (see how each sets up .vertex.base below) -- so
+       * this must NOT be gated on indexing. Only index_type is
+       * conditional: a non-indexed draw has no index buffer, but it
+       * still needs its base vertex applied, exactly like the Bifrost
+       * path does via draw->info.vertex.raw_offset (offset_start).
+       * Leaving this at 0 for non-indexed draws silently drops
+       * firstVertex whenever it's non-zero. */
+      cfg.base_vertex_offset = draw->info.vertex.base;
+
+      if (draw->info.index.index_size)
          cfg.index_type = translate_index_size(draw->info.index.index_size);
-         cfg.base_vertex_offset = draw->info.vertex.base;
-      }
 
       if (vs->info.vs.writes_point_size &&
           ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST)
@@ -2702,51 +2711,6 @@ panvk_draw_prepare_malloc_vertex_job(struct panvk_cmd_buffer *cmdbuf,
 
    draw->jobs.idvs = ptr;
    return VK_SUCCESS;
-}
-
-/* PATCH DEBUG v9 (sementara) -- dump mentah Malloc Vertex Job, biar dicocokin
- * manual ke layout genxml. HAPUS setelah bug ketemu.
- *
- * WAJIB dipanggil SESUDAH pan_jc_add_job(): bytes +000..+031 itu Job Header,
- * dan yang menulisnya adalah pan_jc_add_job(), bukan
- * panvk_draw_prepare_malloc_vertex_job(). Dump sebelum itu selalu memberi
- * header nol -- yang berarti Type=0 (Not started), bukan 11 (Malloc vertex) --
- * dan itu artefak waktu pengambilan dump, bukan bug.
- *
- * Field yang paling penting dicek di sini (v9.xml "Job Header"):
- *   Type            word 4, bit 1..7    -> harus 11 (Malloc vertex)
- *   Index           word 4, bit 16..31  -> nomor job, bukan 0
- *   Dependency 1/2  word 5
- *   Next            word 6..7           -> 0 kalau job terakhir di chain
- */
-static void
-panvk_debug_dump_malloc_vertex_job(const struct pan_ptr *job, const char *label)
-{
-   const uint8_t *bytes = (const uint8_t *)job->cpu;
-   FILE *out = stderr;
-   uint32_t word4, word5;
-
-   memcpy(&word4, bytes + 16, sizeof(word4));
-   memcpy(&word5, bytes + 20, sizeof(word5));
-
-   uint32_t type = (word4 >> 1) & BITFIELD_MASK(7);
-   uint32_t index = word4 >> 16;
-
-   fprintf(out,
-           "[PANVK_DEBUG_MVJ] %s gpu=0x%" PRIx64
-           " header: type=%u (%s) index=%u dep1=%u dep2=%u\n",
-           label, job->gpu, type,
-           type == MALI_JOB_TYPE_MALLOC_VERTEX ? "MALLOC_VERTEX == BENAR"
-                                               : "BUKAN MALLOC_VERTEX",
-           index, word5 & BITFIELD_MASK(16), word5 >> 16);
-
-   fprintf(out, "[PANVK_DEBUG_MVJ] dump 384 byte job descriptor:\n");
-   for (int row = 0; row < 384; row += 16) {
-      fprintf(out, "[PANVK_DEBUG_MVJ] +%03d:", row);
-      for (int col = 0; col < 16; col++)
-         fprintf(out, " %02x", bytes[row + col]);
-      fprintf(out, "\n");
-   }
 }
 
 static VkResult
@@ -2861,7 +2825,6 @@ panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
 {
    const struct panvk_shader_variant *vs =
       panvk_shader_hw_variant(cmdbuf->state.gfx.vs.shader);
-   struct panvk_batch *batch = cmdbuf->cur_batch;
 
    /* If there's no vertex shader, we can skip the draw. On v9 the vertex
     * program is an SPD, not an RSD. */
@@ -2876,7 +2839,7 @@ panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    if (!pos_spd_alloc)
       return;
 
-   assert(batch);
+   assert(cmdbuf->cur_batch);
 
    /* Needs to be done before get_fs() is called because it depends on
     * fs.required being initialized. */
@@ -2886,18 +2849,18 @@ panvk_cmd_draw_v9(struct panvk_cmd_buffer *cmdbuf,
    if (prepare_draw_v9(cmdbuf, draw) != VK_SUCCESS)
       return;
 
+   /* PATCH FIX: read cmdbuf->cur_batch only *after* prepare_draw_v9()
+    * returns, not before calling it. prepare_draw_v9() can close the
+    * current batch and open a new one (its job_index-overflow guard),
+    * which repoints cmdbuf->cur_batch; a copy cached before that call
+    * would go stale, and pan_jc_add_job() below would silently link
+    * this draw's job into the old, already-closed batch instead of the
+    * new one -- invisible on any run that doesn't cross that job_index
+    * threshold, but wrong whenever it does. */
+   struct panvk_batch *batch = cmdbuf->cur_batch;
+
    pan_jc_add_job(&batch->vtc_jc, MALI_JOB_TYPE_MALLOC_VERTEX, false, false, 0,
                   0, &draw->jobs.idvs, false);
-
-   /* PATCH DEBUG v9 (sementara): sesudah pan_jc_add_job, jadi Job Header
-    * sudah terisi. Lihat komentar di panvk_debug_dump_malloc_vertex_job(). */
-   panvk_debug_dump_malloc_vertex_job(&draw->jobs.idvs, "sesudah pan_jc_add_job");
-
-   fprintf(stderr,
-           "[PANVK_DEBUG_MVJ] jc state: first_job=0x%" PRIx64
-           " job_index=%u tiler_dep=%u\n",
-           batch->vtc_jc.first_job, batch->vtc_jc.job_index,
-           batch->vtc_jc.tiler_dep);
 
    clear_dirty_after_draw(cmdbuf);
 }
