@@ -81,7 +81,7 @@ jobs:
               --cross-file android-cross.txt \
               -Dbuildtype=${{ matrix.build-type }} \
               -Dplatforms=x11 \
-              -Dandroid-stub=false \
+              -Dandroid-stub=true \
               -Dandroid-libbacktrace=disabled \
               -Dplatform-sdk-version=30 \
               -Dglx=disabled \
