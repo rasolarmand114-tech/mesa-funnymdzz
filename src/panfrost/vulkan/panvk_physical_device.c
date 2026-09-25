@@ -1211,7 +1211,6 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
-   case 9:
    case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -1222,6 +1221,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       }
       break;
 
+   case 9:
    case 10:
    case 12:
    case 13:
@@ -1342,7 +1342,6 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
-   case 9:
    case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
@@ -1353,6 +1352,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
       }
       break;
 
+   case 9:
    case 10:
    case 11:
    case 12:
