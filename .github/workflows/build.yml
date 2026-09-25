@@ -1,4 +1,4 @@
-name: Android NDK Build (panvk android)
+name: Android NDK Build (Wrapper Variant)
 
 
 on: [push]
@@ -80,7 +80,7 @@ jobs:
           meson setup build --reconfigure \
               --cross-file android-cross.txt \
               -Dbuildtype=${{ matrix.build-type }} \
-              -Dplatforms=android \
+              -Dplatforms=android,x11 \
               -Dandroid-stub=true \
               -Dandroid-libbacktrace=disabled \
               -Dplatform-sdk-version=30 \
