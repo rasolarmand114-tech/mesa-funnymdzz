@@ -59,6 +59,7 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
 
    return batch->tls.gpu;
 }
+
 #if PAN_ARCH < 9
 static void
 cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
@@ -217,10 +218,46 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    clear_dirty_after_dispatch(cmdbuf);
 }
 #else
+/* TODO v9: compute dispatch not yet ported.
+ *
+ * The code above packs a COMPUTE_JOB DRAW section straight out of
+ * panvk_shader_desc_state's Bifrost table layout (->tables[...],
+ * ->img_attrib_table). At PAN_ARCH >= 9 that struct shape doesn't exist
+ * (see panvk_cmd_desc_state.h) -- Valhall replaced the Renderer
+ * State/Attribute Buffer/Invocation descriptors with the Shader-Program
+ * (SPD) + Resource-table model, and the Compute Job section layout
+ * changed with it, so this can't just be recompiled for v9.
+ *
+ * The JM job-chain submission side (cmd_open_batch/cmd_close_batch,
+ * pan_jc_add_job, batch->vtc_jc) stays exactly as above -- v9 is still
+ * JM, only the descriptor model changed. The resource-table side has a
+ * verified, submission-agnostic reference: csf/panvk_vX_cmd_dispatch.c's
+ * prepare_driver_set() + panvk_per_arch(cmd_prepare_shader_res_table)()
+ * already do this for CSF archs and don't touch cs_builder, so the same
+ * two calls apply here unchanged (repeat_count=1, as CSF passes).
+ *
+ * What's missing is the v9 Compute Job/Compute Payload descriptor pack
+ * itself. It is a distinct genxml struct, not a v9 SHADER_ENVIRONMENT
+ * (that's what the graphics path in this same directory's
+ * panvk_vX_cmd_draw.c uses for VS/FS) and not the old COMPUTE_JOB/DRAW
+ * fields packed above -- that field layout
+ * isn't evidenced anywhere in this source subset, so rather than guess
+ * genxml field names for a job the GPU executes directly, this is left
+ * unimplemented. Reference for the actual v9 compute job layout: the
+ * Gallium/OpenGL ES Panfrost driver's pan_cmdstream.c already has a
+ * working v9 compute path (src/gallium/drivers/panfrost/pan_cmdstream.c
+ * upstream) -- that plus the real genxml/v9.xml is what this needs.
+ *
+ * Until then this is a clean no-op, matching how CmdDrawIndirect /
+ * CmdDrawIndexedIndirect are stubbed for v9 elsewhere in this tree:
+ * vkCmdDispatch* completes and signals normally, it just submits no GPU
+ * job. Graphics (vkCmdDraw*) is unaffected. */
 static void
-cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info){
+cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
+{
 }
 #endif
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDispatchBase)(VkCommandBuffer commandBuffer,
                                 uint32_t baseGroupX, uint32_t baseGroupY,
