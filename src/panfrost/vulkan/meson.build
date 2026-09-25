@@ -142,7 +142,7 @@ common_per_arch_files = [
   sha1_h,
 ]
 
-foreach arch : [6, 7, 10, 12, 13, 14]
+foreach arch : [6, 7, 9, 10, 12, 13, 14]
   per_arch_files = common_per_arch_files
   inc_panvk_per_arch = []
 
