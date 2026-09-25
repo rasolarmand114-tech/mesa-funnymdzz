@@ -59,7 +59,7 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
 
    return batch->tls.gpu;
 }
-
+#if PAN_ARCH < 9
 static void
 cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
 {
@@ -216,7 +216,11 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    panvk_per_arch(cmd_close_batch)(cmdbuf);
    clear_dirty_after_dispatch(cmdbuf);
 }
-
+#else
+static void
+cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info){
+}
+#endif
 VKAPI_ATTR void VKAPI_CALL
 panvk_per_arch(CmdDispatchBase)(VkCommandBuffer commandBuffer,
                                 uint32_t baseGroupX, uint32_t baseGroupY,
