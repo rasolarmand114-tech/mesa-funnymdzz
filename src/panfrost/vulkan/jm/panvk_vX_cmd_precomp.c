@@ -13,6 +13,7 @@
 #include "panvk_mempool.h"
 #include "panvk_precomp_cache.h"
 
+#if PAN_ARCH < 9
 void
 panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
                                  struct panlib_precomp_grid grid,
@@ -89,3 +90,48 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
                   suppress_prefetch, grid.jm.local_dep, grid.jm.global_dep,
                   &job, false);
 }
+#else
+/* TODO v9: precompiled-kernel dispatch not yet ported.
+ *
+ * Same root cause as jm/panvk_vX_cmd_dispatch.c: this packs COMPUTE_JOB's
+ * old INVOCATION/PARAMETERS/DRAW sections directly, which don't exist in
+ * that shape at PAN_ARCH >= 9 (confirmed by this exact build error).
+ *
+ * This one is NOT handled the same way as cmd_dispatch(), though:
+ *   - csf/panvk_vX_cmd_precomp.c is not a usable reference here. It
+ *     doesn't pack a job-descriptor struct at all -- CSF has no job
+ *     descriptors, it writes cs_update_compute_ctx()/cs_move*_to()
+ *     register-move instructions straight into a command stream. So it
+ *     can't reveal what v9's actual JM "Compute Job/Compute Payload"
+ *     section layout is; that's JM-only and still needs the real v9
+ *     genxml, which isn't available in this source subset.
+ *   - dispatch_precomp() is shared panlib infrastructure (see
+ *     panvk_cmd_precomp.h's MESA_DISPATCH_PRECOMP), called generically
+ *     for precompiled meta kernels (clears/copies/etc.) from panlib code
+ *     that isn't part of this source subset either, so unlike a single
+ *     VkCmd* entry point its v9 call sites can't be fully enumerated
+ *     here. A silent no-op risks some operation completing as if its
+ *     GPU work ran when it didn't -- worse than a compile error. This
+ *     asserts instead, so any v9 path that still needs it fails loudly
+ *     and points straight back here instead of producing quietly wrong
+ *     results. If that's not what you want while bringing more of v9 up
+ *     (e.g. you'd rather keep going and treat this as inert for now),
+ *     drop the assert() and leave the function body empty -- same
+ *     no-op convention as CmdDrawIndirect/cmd_dispatch()'s v9 stub.
+ *
+ * To actually port this: get the real v9 COMPUTE_JOB section names,
+ * e.g. `grep -A30 'struct name="Compute Job"' src/panfrost/lib/genxml/v9.xml`
+ * or `grep COMPUTE_JOB build/.../genxml/genxml/v9_pack.h` in your tree
+ * (the exact generated-header path depends on your build dir layout) --
+ * that tells us what sections/fields replace INVOCATION/PARAMETERS/DRAW
+ * for v9, and this can be written for real instead of stubbed. */
+void
+panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
+                                 struct panlib_precomp_grid grid,
+                                 enum panlib_barrier barrier,
+                                 enum libpan_shaders_program idx, void *data,
+                                 size_t data_size)
+{
+   assert(!"panvk_v9_dispatch_precomp: not yet implemented (see comment above)");
+}
+#endif
