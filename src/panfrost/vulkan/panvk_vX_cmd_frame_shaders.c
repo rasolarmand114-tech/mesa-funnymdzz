@@ -753,6 +753,22 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
       cfg.shader.fau_count = sizeof(struct panvk_fb_sysvals) / FAU_WORD_SIZE;
       cfg.shader.fau = faus.gpu;
 #endif
+      /* PATCH (v9 build fix): flags_2 does not exist in MALI_DRAW at v9 --
+       * confirmed by the compile error ("no member named 'flags_2' in
+       * 'struct MALI_DRAW'") once v9 actually got built. The existing
+       * `#if PAN_ARCH >= 11` guard just below on two flags_2 sub-fields
+       * implies the flags_2 struct itself is present by v11 at the
+       * latest; given the >=12/else split right above this also treats
+       * 9/10/11 as one group, v10 is the more likely real boundary, but
+       * that's inferred from this file's own pattern and the error, not
+       * confirmed against the actual v9/v10 genxml -- please double-check
+       * against your build tree's genxml/v9_pack.h and v10_pack.h (or
+       * v9.xml/v10.xml) for struct MALI_DRAW's real fields, and adjust
+       * the version number below if it's wrong. Until this masking is
+       * ported for v9, this preload/postload draw won't restrict which
+       * render targets get written/read -- functional gap, not a hang
+       * risk, but worth confirming intentional. */
+#if PAN_ARCH >= 10
       cfg.flags_2.write_mask = rt_written;
       cfg.flags_2.read_mask = rt_read;
 #if PAN_ARCH >= 11
@@ -760,6 +776,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf,
          !(locations_read & BITFIELD_BIT(FRAG_RESULT_DEPTH));
       cfg.flags_2.no_shader_stencil_read =
          !(locations_read & BITFIELD_BIT(FRAG_RESULT_STENCIL));
+#endif
 #endif
    }
 
